@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>MLXr — MLX Model Engine Manager</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">◆</span>
+        <span>MLXr</span>
+        <small>Apple MLX engine manager</small>
+      </div>
+      <div class="topbar-right">
+        <span class="pill" id="versionsPill" title="Installed package versions">versions: …</span>
+        <span class="pill" id="enginePill">engine: idle</span>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2>Model</h2>
+        <div class="row">
+          <input id="modelName" list="modelList" placeholder="mlx-community/Llama-3.2-1B-Instruct-4bit" />
+          <datalist id="modelList"></datalist>
+          <button id="loadBtn" class="primary">Load</button>
+          <button id="unloadBtn">Unload</button>
+        </div>
+        <div id="modelInfo" class="info">No model loaded.</div>
+        <details id="modelSettingsWrap" class="example" style="margin-top: 10px;">
+          <summary>Defaults for this model</summary>
+          <div class="settings-form">
+            <label>System prompt
+              <textarea id="setSystem" rows="3" placeholder="Optional default system prompt applied when clients don't send one"></textarea>
+            </label>
+            <div class="settings-row">
+              <label>Temperature <input id="setTemperature" type="number" min="0" max="2" step="0.05" placeholder="0.70" /></label>
+              <label>top_p <input id="setTopP" type="number" min="0" max="1" step="0.05" placeholder="0.95" /></label>
+              <label>max_tokens <input id="setMaxTokens" type="number" min="1" max="131072" step="1" placeholder="512" /></label>
+            </div>
+            <label class="checkbox-row"><input id="setStripThinking" type="checkbox" checked /> Strip <code>&lt;think&gt;…&lt;/think&gt;</code> reasoning blocks from responses</label>
+            <label>Thinking mode (Qwen3 / reasoning models)
+              <select id="setEnableThinking">
+                <option value="auto">auto — disable when tools, enable otherwise</option>
+                <option value="true">always enable</option>
+                <option value="false">always disable</option>
+              </select>
+            </label>
+            <label class="checkbox-row"><input id="setAutoload" type="checkbox" /> Autoload this model on server start</label>
+            <div class="row" style="margin-top: 6px;">
+              <button id="saveSettingsBtn" class="primary">Save</button>
+              <button id="resetSettingsBtn">Reset</button>
+              <span id="settingsHint" class="muted"></span>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>Host</h2>
+        <div class="stats">
+          <div><label>CPU</label><meter id="cpuMeter" min="0" max="100" value="0"></meter><span id="cpuVal">—</span></div>
+          <div><label>RAM</label><meter id="memMeter" min="0" max="100" value="0"></meter><span id="memVal">—</span></div>
+          <div><label>MLX active</label><span id="mlxActive">—</span></div>
+          <div><label>MLX peak</label><span id="mlxPeak">—</span></div>
+          <div><label>MLX cache</label><span id="mlxCache">—</span></div>
+        </div>
+      </section>
+
+      <section class="card span-2">
+        <h2>Engine</h2>
+        <div id="pythonWarn" class="warn-banner hidden"></div>
+        <table id="engineVersions" class="vtable"></table>
+        <div class="row" style="margin-top: 10px;">
+          <button id="checkUpdatesBtn">Check for updates</button>
+          <button id="upgradeBtn" class="primary" disabled>Update MLX</button>
+          <button id="restartBtn">Restart server</button>
+          <span id="engineHint" class="muted"></span>
+        </div>
+        <pre id="engineLog" class="output mini-output hidden"></pre>
+      </section>
+
+      <section class="card span-2">
+        <h2>API Endpoint <span id="apiStatusBadge" class="badge">idle</span></h2>
+        <p class="muted" style="margin: 0 0 12px">OpenAI-compatible endpoint — point any OpenAI SDK, Cursor, Continue, OpenWebUI, LibreChat, Raycast AI, etc. here. No API key required.</p>
+        <table class="vtable">
+          <tr>
+            <td class="pkg">Base URL</td>
+            <td class="ver mono"><code id="apiBaseUrl">—</code></td>
+            <td class="status"><button data-copy-target="apiBaseUrl">Copy</button></td>
+          </tr>
+          <tr>
+            <td class="pkg">Chat completions</td>
+            <td class="ver mono"><code id="apiChatUrl">—</code></td>
+            <td class="status"><button data-copy-target="apiChatUrl">Copy</button></td>
+          </tr>
+          <tr>
+            <td class="pkg">Model ID</td>
+            <td class="ver mono"><code id="apiModelId">no model loaded</code></td>
+            <td class="status"><button data-copy-target="apiModelId">Copy</button></td>
+          </tr>
+          <tr>
+            <td class="pkg">API Key</td>
+            <td class="ver mono"><code>not required (any value works)</code></td>
+            <td class="status"></td>
+          </tr>
+        </table>
+        <details class="example" open>
+          <summary>OpenCode provider config <span class="muted">(~/.config/opencode/opencode.json)</span></summary>
+          <pre id="opencodeExample" class="output mini-output"></pre>
+        </details>
+        <details class="example">
+          <summary>curl</summary>
+          <pre id="curlExample" class="output mini-output"></pre>
+        </details>
+        <details class="example">
+          <summary>OpenAI Python SDK</summary>
+          <pre id="pythonExample" class="output mini-output"></pre>
+        </details>
+        <details class="example">
+          <summary>JSON config (Cursor / Continue / OpenWebUI)</summary>
+          <pre id="configExample" class="output mini-output"></pre>
+        </details>
+      </section>
+
+      <section class="card span-2">
+        <h2>Import from Hugging Face</h2>
+        <div class="row">
+          <input id="hfQuery" placeholder="Search query (e.g. llama, qwen, phi)" />
+          <input id="hfAuthor" value="mlx-community" placeholder="author (blank = any)" style="flex: 0 1 200px" />
+          <button id="hfSearchBtn" class="primary">Search</button>
+          <button id="hfRefreshCacheBtn">Refresh cache</button>
+        </div>
+        <div class="hf-split">
+          <div>
+            <h3 class="mini">Results</h3>
+            <ul id="hfResults" class="list"></ul>
+          </div>
+          <div>
+            <h3 class="mini">Downloads</h3>
+            <ul id="hfDownloads" class="list"></ul>
+            <h3 class="mini">Local cache</h3>
+            <div id="hfCacheTotal" class="muted"></div>
+            <ul id="hfCache" class="list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="card span-2">
+        <h2>Playground</h2>
+        <div class="controls">
+          <label>max_tokens <input id="maxTokens" type="number" min="1" max="4096" value="256" /></label>
+          <label>temperature <input id="temperature" type="number" min="0" max="2" step="0.05" value="0.7" /></label>
+          <label>top_p <input id="topP" type="number" min="0" max="1" step="0.05" value="0.95" /></label>
+          <label class="grow">system <input id="system" placeholder="Optional system prompt" /></label>
+        </div>
+        <textarea id="prompt" rows="4" placeholder="Ask the model something…"></textarea>
+        <div class="row">
+          <button id="genBtn" class="primary">Generate</button>
+          <button id="stopBtn" disabled>Stop</button>
+          <span id="genStats" class="muted"></span>
+        </div>
+        <pre id="output" class="output"></pre>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

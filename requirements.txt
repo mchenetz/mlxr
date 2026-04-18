@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+mlx>=0.21
+mlx-lm>=0.21
+psutil>=5.9
+huggingface_hub>=0.23
