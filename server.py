@@ -59,9 +59,43 @@ class LoadedModel:
     loaded_at: float
     model: Any
     tokenizer: Any
+    context_length: int = 32768   # auto-detected from model config at load time
     generations: int = 0
     total_tokens: int = 0
     last_used: float = field(default_factory=time.time)
+
+
+def _detect_context_length(tokenizer: Any, model_name: str) -> int:
+    """Return the model's context window size.
+
+    Priority:
+    1. tokenizer.model_max_length — set correctly by most modern tokenizers
+       but some (e.g. very old or debug tokenizers) set it to sys.maxsize.
+    2. config.json in the HF cache — check max_position_embeddings at
+       top level and inside text_config (VLMs nest it there).
+    3. Fallback: 32768 (conservative but safe for all current Apple Silicon).
+    """
+    # 1. Tokenizer attribute
+    tok_max = getattr(tokenizer, "model_max_length", None)
+    if tok_max and isinstance(tok_max, int) and tok_max < 10_000_000:
+        return tok_max
+
+    # 2. HF cache config.json
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        config_path = try_to_load_from_cache(model_name, "config.json")
+        if config_path:
+            import json as _json
+            cfg = _json.loads(open(config_path).read())
+            for source in (cfg, cfg.get("text_config", {})):
+                for key in ("max_position_embeddings", "n_positions", "seq_length"):
+                    val = source.get(key)
+                    if val and isinstance(val, int):
+                        return val
+    except Exception as e:
+        log.debug("context length detection failed: %s", e)
+
+    return 32768
 
 
 class Engine:
@@ -105,7 +139,16 @@ class Engine:
             t0 = time.time()
             model, tokenizer = mlx_load(name)
             log.info("Loaded %s in %.1fs", name, time.time() - t0)
-            loaded = LoadedModel(name=name, loaded_at=time.time(), model=model, tokenizer=tokenizer)
+            # Detect context window; honour per-model override from settings.
+            auto_ctx = _detect_context_length(tokenizer, name)
+            saved_ctx = settings.get_model(name).get("context_length")
+            ctx = int(saved_ctx) if saved_ctx else auto_ctx
+            log.info("Context length for %s: %d%s", name, ctx,
+                     " (overridden in settings)" if saved_ctx else " (auto-detected)")
+            loaded = LoadedModel(
+                name=name, loaded_at=time.time(),
+                model=model, tokenizer=tokenizer, context_length=ctx,
+            )
             with self._lock:
                 self._current = loaded
                 self._loading = None
@@ -508,6 +551,7 @@ def _model_state() -> dict:
         "generations": cur.generations,
         "total_tokens": cur.total_tokens,
         "last_used": cur.last_used,
+        "context_length": cur.context_length,
     }
 
 
@@ -1389,6 +1433,7 @@ def v1_models() -> dict:
             "object": "model",
             "created": int(cur.loaded_at),
             "owned_by": "mlxr",
+            "context_length": cur.context_length,  # non-standard but useful for clients
         })
     return {"object": "list", "data": data}
 

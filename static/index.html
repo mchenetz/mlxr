@@ -38,7 +38,8 @@
             <div class="settings-row">
               <label>Temperature <input id="setTemperature" type="number" min="0" max="2" step="0.05" placeholder="0.70" /></label>
               <label>top_p <input id="setTopP" type="number" min="0" max="1" step="0.05" placeholder="0.95" /></label>
-              <label>max_tokens <input id="setMaxTokens" type="number" min="1" max="131072" step="1" placeholder="4096" title="Used as the default when a client doesn't specify. Leave blank to use the server default (4096). AI coding agents automatically get 16 384 when tools are active." /></label>
+              <label>max_tokens <input id="setMaxTokens" type="number" min="1" max="131072" step="1" placeholder="4096" title="Default output token limit when a client doesn't specify. Leave blank for server default (4096). Tool-calling agents auto-escalate to 16 384." /></label>
+              <label>context_length <input id="setContextLength" type="number" min="512" max="1048576" step="512" placeholder="auto-detect" title="Override the advertised context window (tokens). Leave blank to use the value auto-detected from the model config. Lower this to reduce RAM usage." /></label>
             </div>
             <label class="checkbox-row"><input id="setStripThinking" type="checkbox" checked /> Strip <code>&lt;think&gt;…&lt;/think&gt;</code> reasoning blocks from responses</label>
             <label>Thinking mode (Qwen3 / reasoning models)

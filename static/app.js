@@ -77,13 +77,14 @@ function renderStatus(s) {
   renderPythonWarning(versions);
 
   $("modelInfo").textContent = m.loaded
-    ? `name:         ${m.name}
-uptime:       ${fmtSeconds(m.uptime_seconds)}
-generations:  ${m.generations}
-total_tokens: ${m.total_tokens}`
+    ? `name:           ${m.name}
+context_length: ${m.context_length != null ? m.context_length.toLocaleString() + " tokens" : "unknown"}
+uptime:         ${fmtSeconds(m.uptime_seconds)}
+generations:    ${m.generations}
+total_tokens:   ${m.total_tokens}`
     : "No model loaded.";
 
-  renderEndpoint(m.loaded ? m.name : null);
+  renderEndpoint(m.loaded ? m.name : null, m.context_length);
   onModelStateChanged(m);
 
   const dl = $("modelList");
@@ -388,6 +389,7 @@ async function loadModelSettings(name) {
     $("setTemperature").value = s.temperature != null ? s.temperature : "";
     $("setTopP").value = s.top_p != null ? s.top_p : "";
     $("setMaxTokens").value = s.max_tokens != null ? s.max_tokens : "";
+    $("setContextLength").value = s.context_length != null ? s.context_length : "";
     $("setAutoload").checked = !!s.autoload;
     // default on if unset
     $("setStripThinking").checked = s.strip_thinking !== false;
@@ -407,6 +409,7 @@ $("saveSettingsBtn").addEventListener("click", async () => {
     temperature: $("setTemperature").value === "" ? null : Number($("setTemperature").value),
     top_p: $("setTopP").value === "" ? null : Number($("setTopP").value),
     max_tokens: $("setMaxTokens").value === "" ? null : Number($("setMaxTokens").value),
+    context_length: $("setContextLength").value === "" ? null : Number($("setContextLength").value),
     autoload: $("setAutoload").checked,
     strip_thinking: $("setStripThinking").checked,
     enable_thinking:
@@ -439,7 +442,7 @@ $("resetSettingsBtn").addEventListener("click", async () => {
 
 // ---- API Endpoint info ------------------------------------------------
 
-function renderEndpoint(modelName) {
+function renderEndpoint(modelName, contextLength) {
   const base = `${location.origin}/v1`;
   const chat = `${base}/chat/completions`;
   $("apiBaseUrl").textContent = base;
@@ -457,6 +460,7 @@ function renderEndpoint(modelName) {
 
   const name = modelName || "mlx-community/Llama-3.2-1B-Instruct-4bit";
   const shortName = name.split("/").pop() + " (MLX)";
+  const ctxLen = contextLength || 32768;  // use detected value or safe fallback
 
   // ── OpenCode ──────────────────────────────────────────────────────────────
   $("opencodeExample").textContent = JSON.stringify({
@@ -487,7 +491,7 @@ ${JSON.stringify({
             {
               name,
               display_name: shortName,
-              max_tokens: 32768,
+              max_tokens: ctxLen,
               capabilities: {
                 tools: true,
                 images: false,
