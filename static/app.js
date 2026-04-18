@@ -456,17 +456,95 @@ function renderEndpoint(modelName) {
   }
 
   const name = modelName || "mlx-community/Llama-3.2-1B-Instruct-4bit";
-  const curlBody = {
-    model: name,
-    messages: [{ role: "user", content: "Hello!" }],
-    stream: false,
-  };
+  const shortName = name.split("/").pop() + " (MLX)";
+
+  // ── OpenCode ──────────────────────────────────────────────────────────────
+  $("opencodeExample").textContent = JSON.stringify({
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      mlxr: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "MLXr (local)",
+        options: { baseURL: base, apiKey: "not-needed" },
+        models: { [name]: { name: shortName } },
+      },
+    },
+  }, null, 2);
+
+  // ── Zed ───────────────────────────────────────────────────────────────────
+  // Merge into existing ~/.config/zed/settings.json; these are the relevant keys.
+  $("zedExample").textContent = JSON.stringify({
+    language_models: {
+      openai: {
+        api_url: base,
+        available_models: [
+          { name, display_name: shortName, max_tokens: 32768 },
+        ],
+      },
+    },
+    assistant: {
+      default_model: { provider: "openai", model: name },
+      version: "2",
+    },
+  }, null, 2);
+
+  // ── Cursor ────────────────────────────────────────────────────────────────
+  // Settings → Features → OpenAI API Key section → override base URL.
+  $("cursorExample").textContent =
+`# Cursor → Settings → Features → OpenAI API Key
+#   API Key:  not-needed
+#   Override OpenAI Base URL:  ${base}
+
+# Or in .cursor/mcp.json for project-level:
+${JSON.stringify({ openai: { baseUrl: base, apiKey: "not-needed" } }, null, 2)}`;
+
+  // ── Continue (VS Code / JetBrains) ────────────────────────────────────────
+  $("continueExample").textContent = JSON.stringify({
+    models: [
+      {
+        title: shortName,
+        provider: "openai",
+        model: name,
+        apiBase: base,
+        apiKey: "not-needed",
+      },
+    ],
+  }, null, 2);
+
+  // ── Aider ─────────────────────────────────────────────────────────────────
+  $("aiderExample").textContent =
+`# One-off:
+aider \\
+  --openai-api-base ${base} \\
+  --openai-api-key not-needed \\
+  --model openai/${name}
+
+# Or persist in ~/.aider.conf.yml:
+openai-api-base: ${base}
+openai-api-key: not-needed
+model: openai/${name}`;
+
+  // ── Neovim / avante.nvim ──────────────────────────────────────────────────
+  $("neoExample").textContent =
+`-- ~/.config/nvim/init.lua  (or your lazy.nvim spec)
+require("avante").setup({
+  provider = "openai",
+  openai = {
+    endpoint = "${base}",
+    model    = "${name}",
+    api_key  = "not-needed",
+    max_tokens = 32768,
+  },
+})`;
+
+  // ── curl ──────────────────────────────────────────────────────────────────
   $("curlExample").textContent =
 `curl ${chat} \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer not-needed" \\
-  -d '${JSON.stringify(curlBody)}'`;
+  -d '${JSON.stringify({ model: name, messages: [{ role: "user", content: "Hello!" }], stream: false })}'`;
 
+  // ── OpenAI Python SDK ─────────────────────────────────────────────────────
   $("pythonExample").textContent =
 `from openai import OpenAI
 
@@ -476,38 +554,6 @@ resp = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(resp.choices[0].message.content)`;
-
-  $("configExample").textContent = JSON.stringify(
-    {
-      baseURL: base,
-      apiKey: "not-needed",
-      model: name,
-    },
-    null,
-    2,
-  );
-
-  // OpenCode uses the Vercel AI SDK's openai-compatible provider.
-  // Drop this into ~/.config/opencode/opencode.json (or project-local opencode.json).
-  const opencodeConfig = {
-    $schema: "https://opencode.ai/config.json",
-    provider: {
-      mlxr: {
-        npm: "@ai-sdk/openai-compatible",
-        name: "MLXr (local)",
-        options: {
-          baseURL: base,
-          apiKey: "not-needed",
-        },
-        models: {
-          [name]: {
-            name: name.split("/").pop() + " (MLX)",
-          },
-        },
-      },
-    },
-  };
-  $("opencodeExample").textContent = JSON.stringify(opencodeConfig, null, 2);
 }
 
 // Delegated copy handler for any button with data-copy-target
