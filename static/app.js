@@ -472,13 +472,7 @@ function renderEndpoint(modelName) {
   }, null, 2);
 
   // ── Zed ───────────────────────────────────────────────────────────────────
-  // Zed requires a non-empty API key even for local servers — it won't send
-  // requests if the key is missing. Set it once via the command palette:
-  //   cmd+shift+p  →  "zed: set openai api key"  →  type: mlxr-local
-  // OR export OPENAI_API_KEY=mlxr-local in your shell profile.
-  // Zed reads the API key from the env var MLXR_API_KEY (provider name uppercased).
-  // Add to your shell profile: export MLXR_API_KEY=mlxr-local
-  // Then merge into ~/.config/zed/settings.json:
+  // Zed reads the API key from env var MLXR_API_KEY (provider name uppercased).
   $("zedExample").textContent =
 `# Add to your shell profile (~/.zshrc / ~/.zprofile):
 #   export MLXR_API_KEY=mlxr-local
@@ -504,10 +498,6 @@ ${JSON.stringify({
           ],
         },
       },
-    },
-    assistant: {
-      default_model: { provider: "openai_compatible", model: name },
-      version: "2",
     },
   }, null, 2)}`;
 
