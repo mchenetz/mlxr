@@ -556,7 +556,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)`;
 }
 
-// Delegated copy handler for any button with data-copy-target
+// Delegated copy handler for table-row copy buttons (data-copy-target)
 document.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-copy-target]");
   if (!btn) return;
@@ -568,6 +568,29 @@ document.addEventListener("click", (e) => {
       const prev = btn.textContent;
       btn.textContent = "Copied";
       setTimeout(() => (btn.textContent = prev), 1200);
+    },
+    () => toast("Copy failed", "err"),
+  );
+});
+
+// Copy-snippet buttons inside <summary> elements.
+// Must stopPropagation so clicking the button doesn't toggle the <details>.
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button.copy-snippet[data-snippet]");
+  if (!btn) return;
+  e.stopPropagation();   // prevent <details> toggle
+  e.preventDefault();
+  const pre = $(btn.dataset.snippet);
+  if (!pre) return;
+  navigator.clipboard.writeText(pre.textContent || "").then(
+    () => {
+      const prev = btn.textContent;
+      btn.textContent = "✓";
+      btn.classList.add("copied");
+      setTimeout(() => {
+        btn.textContent = prev;
+        btn.classList.remove("copied");
+      }, 1500);
     },
     () => toast("Copy failed", "err"),
   );
