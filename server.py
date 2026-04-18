@@ -446,11 +446,15 @@ class GenerateRequest(BaseModel):
 
 # Hard fallbacks used when neither the request nor saved settings specify a value.
 DEFAULT_GEN: dict[str, Any] = {
-    "max_tokens": 512,
+    "max_tokens": 4096,   # raised from 512 — tool-call arguments (file writes etc.) need headroom
     "temperature": 0.7,
     "top_p": 0.95,
     "system": None,
 }
+# When tools are active and the client/user haven't set a token limit, use a
+# higher floor so that tool-call arguments (e.g. write_file with a full file
+# body) aren't silently truncated mid-JSON.
+DEFAULT_TOOLS_MAX_TOKENS = 16384
 
 
 def _resolve_gen(cur: LoadedModel, req: GenerateRequest) -> GenerateRequest:
@@ -833,45 +837,107 @@ class ToolCallParser:
     #     <parameter=KEY2>\nVALUE2\n</parameter>
     #   </function>
     # We're lenient about whitespace and attribute quoting.
-    _XML_FUNCTION_RE = __import__("re").compile(
-        r"<function\s*=\s*[\"']?([^\s\"'>]+)[\"']?\s*>(.*?)</function\s*>",
-        __import__("re").DOTALL,
+    #
+    # IMPORTANT: we use a stack-based approach rather than regex `.*?` (non-greedy)
+    # because file content may legitimately contain the literal strings
+    # "</parameter>" or "</function>" (e.g. XML files, HTML, Jinja templates).
+    # Non-greedy matching would terminate early on the first such occurrence and
+    # silently truncate the content. The manual parser below handles nesting depth.
+
+    _XML_FUNCTION_OPEN_RE = __import__("re").compile(
+        r"<function\s*=\s*[\"']?([^\s\"'>]+)[\"']?\s*>",
     )
-    _XML_PARAMETER_RE = __import__("re").compile(
-        r"<parameter\s*=\s*[\"']?([^\s\"'>]+)[\"']?\s*>(.*?)</parameter\s*>",
-        __import__("re").DOTALL,
+    _XML_PARAMETER_OPEN_RE = __import__("re").compile(
+        r"<parameter\s*=\s*[\"']?([^\s\"'>]+)[\"']?\s*>",
     )
 
     @classmethod
     def _parse_xml_tools(cls, text: str) -> list[dict]:
+        """Parse Qwen3-style XML tool calls using a depth-tracking approach.
+
+        Handles the case where file content contains the literal strings
+        </parameter> or </function> without prematurely terminating the match.
+        """
         results: list[dict] = []
-        for fn_match in cls._XML_FUNCTION_RE.finditer(text):
-            name = fn_match.group(1).strip()
-            body = fn_match.group(2)
+        pos = 0
+        while pos < len(text):
+            fn_m = cls._XML_FUNCTION_OPEN_RE.search(text, pos)
+            if not fn_m:
+                break
+            fn_name = fn_m.group(1).strip()
+            body_start = fn_m.end()
+
+            # Find the matching </function> by tracking open/close depth.
+            body, body_end = cls._find_closing(text, body_start, "<function", "</function>")
+            if body is None:
+                # Unclosed tag — nothing more to parse.
+                break
+            pos = body_end
+
             params: dict[str, Any] = {}
-            for param_match in cls._XML_PARAMETER_RE.finditer(body):
-                key = param_match.group(1).strip()
-                raw_val = param_match.group(2).strip()
-                # Best-effort type inference: JSON-parse if it looks like JSON,
-                # else keep as string. Agent frameworks usually accept both.
-                if raw_val and raw_val[0] in "{[\"" or raw_val in ("true", "false", "null") or cls._looks_numeric(raw_val):
+            param_pos = 0
+            while param_pos < len(body):
+                pm = cls._XML_PARAMETER_OPEN_RE.search(body, param_pos)
+                if not pm:
+                    break
+                key = pm.group(1).strip()
+                val_start = pm.end()
+                raw_val, val_end = cls._find_closing(body, val_start, "<parameter", "</parameter>")
+                if raw_val is None:
+                    break
+                param_pos = val_end
+
+                # Preserve raw value without stripping — leading/trailing
+                # whitespace in file content is significant. Only strip for
+                # type-detection; store the original.
+                stripped = raw_val.strip()
+                if stripped and (stripped[0] in "{[\"" or stripped in ("true", "false", "null") or cls._looks_numeric(stripped)):
                     try:
-                        params[key] = json.loads(raw_val)
+                        params[key] = json.loads(stripped)
                         continue
                     except Exception:
                         pass
-                params[key] = raw_val
-            if not name:
+                # Store with only a single leading/trailing newline stripped
+                # (the model typically wraps values in \n…\n).
+                params[key] = raw_val.lstrip("\n").rstrip("\n")
+
+            if not fn_name:
                 continue
             results.append({
                 "id": f"call_{uuid.uuid4().hex[:20]}",
                 "type": "function",
                 "function": {
-                    "name": name,
+                    "name": fn_name,
                     "arguments": json.dumps(params, ensure_ascii=False),
                 },
             })
         return results
+
+    @staticmethod
+    def _find_closing(text: str, start: int, open_tag_prefix: str, close_tag: str) -> tuple[Optional[str], int]:
+        """Return (body, end_pos) where body is the text between start and the
+        matching close_tag, respecting nesting of open_tag_prefix.
+
+        Returns (None, start) if the close_tag is never found.
+        """
+        depth = 1
+        pos = start
+        close_len = len(close_tag)
+        while pos < len(text):
+            next_close = text.find(close_tag, pos)
+            next_open = text.find(open_tag_prefix, pos)
+            if next_close < 0:
+                return None, start  # unclosed
+            # If there's a nested open before the next close, go deeper.
+            if next_open >= 0 and next_open < next_close:
+                depth += 1
+                pos = next_open + len(open_tag_prefix)
+            else:
+                depth -= 1
+                if depth == 0:
+                    return text[start:next_close], next_close + close_len
+                pos = next_close + close_len
+        return None, start
 
     @staticmethod
     def _looks_numeric(s: str) -> bool:
@@ -1123,7 +1189,7 @@ async def api_generate(req: GenerateRequest):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    text, tokens = await asyncio.to_thread(_generate_blocking, cur, rendered, req)
+    text, tokens, _fr = await asyncio.to_thread(_generate_blocking, cur, rendered, req)
     cur.generations += 1
     cur.total_tokens += tokens
     cur.last_used = time.time()
@@ -1133,31 +1199,48 @@ async def api_generate(req: GenerateRequest):
 def _generate_blocking(
     cur: LoadedModel, rendered: str, req: GenerateRequest,
     starts_in_think: bool = False,
-) -> tuple[str, int]:
-    from mlx_lm import generate as mlx_generate
+) -> tuple[str, int, str]:
+    """Run blocking generation. Returns (text, token_count, finish_reason)."""
+    from mlx_lm import stream_generate
 
-    kwargs: dict[str, Any] = {"max_tokens": req.max_tokens, "verbose": False}
-    # mlx-lm's API surface drifted across versions; try the modern sampler arg first.
+    parts: list[str] = []
+    token_count = 0
+    finish_reason = "stop"
+
     try:
         from mlx_lm.sample_utils import make_sampler
-
-        kwargs["sampler"] = make_sampler(temp=req.temperature, top_p=req.top_p)
+        sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
+        iterator = stream_generate(
+            cur.model, cur.tokenizer, prompt=rendered,
+            max_tokens=req.max_tokens, sampler=sampler,
+        )
     except Exception:
-        kwargs["temp"] = req.temperature
+        iterator = stream_generate(
+            cur.model, cur.tokenizer, prompt=rendered,
+            max_tokens=req.max_tokens, temp=req.temperature,
+        )
 
     t0 = time.time()
     with engine.gen_lock:
         waited = time.time() - t0
         if waited > 0.1:
             log.info("MLX (blocking) queued for %.1fs before starting", waited)
-        text = mlx_generate(cur.model, cur.tokenizer, prompt=rendered, **kwargs)
+        for c in iterator:
+            piece = getattr(c, "text", c) if not isinstance(c, str) else c
+            if piece:
+                parts.append(piece)
+            token_count += 1
+            fr = getattr(c, "finish_reason", None)
+            if fr:
+                finish_reason = fr
+
+    text = "".join(parts)
     if text:
         text = ThinkStripper(
             enabled=_strip_thinking_enabled(cur),
             starts_in_think=starts_in_think,
         ).strip(text)
-    tokens = len(cur.tokenizer.encode(text)) if text else 0
-    return text, tokens
+    return text, token_count, finish_reason
 
 
 async def _stream_generation(cur: LoadedModel, rendered: str, req: GenerateRequest) -> AsyncIterator[bytes]:
@@ -1417,9 +1500,24 @@ async def v1_chat_completions(req: OAIChatRequest):
         "finish_reason": None,
     })
 
+    # Token budget: client value > saved model setting > default.
+    # When tools are active and neither the client nor the user set a limit,
+    # escalate to DEFAULT_TOOLS_MAX_TOKENS so tool-call arguments (e.g. a
+    # write_file body) are never truncated mid-JSON by a conservative default.
+    client_max = req.effective_max_tokens()
+    saved_max = saved.get("max_tokens")
+    if client_max is not None:
+        resolved_max_tokens = client_max
+    elif saved_max is not None:
+        resolved_max_tokens = saved_max
+    elif tools_active:
+        resolved_max_tokens = DEFAULT_TOOLS_MAX_TOKENS
+    else:
+        resolved_max_tokens = DEFAULT_GEN["max_tokens"]
+
     gen_req = GenerateRequest(
         prompt="",  # not used for chat-template path
-        max_tokens=req.effective_max_tokens() if req.effective_max_tokens() is not None else saved.get("max_tokens", DEFAULT_GEN["max_tokens"]),
+        max_tokens=resolved_max_tokens,
         temperature=req.temperature if req.temperature is not None else saved.get("temperature", DEFAULT_GEN["temperature"]),
         top_p=req.top_p if req.top_p is not None else saved.get("top_p", DEFAULT_GEN["top_p"]),
         stream=req.stream,
@@ -1436,7 +1534,7 @@ async def v1_chat_completions(req: OAIChatRequest):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    text, tokens = await asyncio.to_thread(
+    text, tokens, gen_finish_reason = await asyncio.to_thread(
         _generate_blocking, cur, prompt, gen_req, starts_in_think,
     )
     # Record what the model actually produced for diagnostics.
@@ -1445,6 +1543,12 @@ async def v1_chat_completions(req: OAIChatRequest):
         "tokens": tokens,
     })
     log.info("chat: id=%s blocking output preview=%r", entry_id, (text or "")[:400])
+    if gen_finish_reason == "length" and tools_active:
+        log.warning(
+            "chat: id=%s hit max_tokens=%d (blocking) while tools were active — "
+            "tool-call arguments may be truncated.",
+            entry_id, gen_req.max_tokens,
+        )
     cur.generations += 1
     cur.total_tokens += tokens
     cur.last_used = time.time()
@@ -1469,7 +1573,7 @@ async def v1_chat_completions(req: OAIChatRequest):
     if tool_calls:
         message["tool_calls"] = tool_calls
 
-    finish_reason = "tool_calls" if tool_calls else "stop"
+    finish_reason = "tool_calls" if tool_calls else gen_finish_reason
     _update_chat(entry_id, {
         "tool_calls_emitted": len(tool_calls),
         "finish_reason": finish_reason,
@@ -1662,10 +1766,19 @@ async def _oai_stream_chat(
                         cur.model, cur.tokenizer, prompt=prompt,
                         max_tokens=req.max_tokens, temp=req.temperature,
                     )
+                gen_finish_reason = "stop"
                 for c in iterator:
                     piece = getattr(c, "text", c) if not isinstance(c, str) else c
                     if piece:
                         asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
+                    # mlx-lm sets finish_reason on the final GenerationResponse.
+                    fr = getattr(c, "finish_reason", None)
+                    if fr:
+                        gen_finish_reason = fr
+                # Send finish_reason to the consumer via a sentinel dict.
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({"__finish_reason__": gen_finish_reason}), loop
+                )
             except Exception as e:
                 asyncio.run_coroutine_threadsafe(queue.put({"__error__": str(e)}), loop)
             finally:
@@ -1707,6 +1820,9 @@ async def _oai_stream_chat(
         item = await queue.get()
         if item is sentinel:
             break
+        if isinstance(item, dict) and "__finish_reason__" in item:
+            finish_reason = item["__finish_reason__"]  # "stop" or "length" from mlx-lm
+            continue
         if isinstance(item, dict) and "__error__" in item:
             log.warning("chat: id=%s stream error: %s", completion_id, item["__error__"])
             # "stop" is the only safe finish_reason for unexpected errors;
@@ -1746,6 +1862,16 @@ async def _oai_stream_chat(
 
     if tools_emitted and finish_reason == "stop":
         finish_reason = "tool_calls"
+
+    # Warn when the context window was exhausted mid tool-call — this means
+    # arguments were truncated and the tool call will likely be malformed.
+    if finish_reason == "length" and tools_active:
+        log.warning(
+            "chat: id=%s hit max_tokens=%d while tools were active — tool-call "
+            "arguments may be truncated. Consider raising max_tokens in the "
+            "dashboard or sending a higher max_completion_tokens from the client.",
+            completion_id, req.max_tokens,
+        )
 
     yield chunk({}, finish_reason=finish_reason)
 
