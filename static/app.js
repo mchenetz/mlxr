@@ -465,15 +465,26 @@ function renderEndpoint(modelName) {
       mlxr: {
         npm: "@ai-sdk/openai-compatible",
         name: "MLXr (local)",
-        options: { baseURL: base, apiKey: "not-needed" },
+        options: { baseURL: base, apiKey: "mlxr-local" },
         models: { [name]: { name: shortName } },
       },
     },
   }, null, 2);
 
   // ── Zed ───────────────────────────────────────────────────────────────────
-  // Merge into existing ~/.config/zed/settings.json; these are the relevant keys.
-  $("zedExample").textContent = JSON.stringify({
+  // Zed requires a non-empty API key even for local servers — it won't send
+  // requests if the key is missing. Set it once via the command palette:
+  //   cmd+shift+p  →  "zed: set openai api key"  →  type: mlxr-local
+  // OR export OPENAI_API_KEY=mlxr-local in your shell profile.
+  // Then merge these keys into ~/.config/zed/settings.json:
+  $("zedExample").textContent =
+`// Step 1 — set a dummy API key (one-time, stored in keychain):
+//   cmd+shift+p → "zed: set openai api key" → mlxr-local
+// OR add to your shell profile:
+//   export OPENAI_API_KEY=mlxr-local
+
+// Step 2 — merge into ~/.config/zed/settings.json:
+${JSON.stringify({
     language_models: {
       openai: {
         api_url: base,
@@ -486,17 +497,16 @@ function renderEndpoint(modelName) {
       default_model: { provider: "openai", model: name },
       version: "2",
     },
-  }, null, 2);
+  }, null, 2)}`;
 
   // ── Cursor ────────────────────────────────────────────────────────────────
-  // Settings → Features → OpenAI API Key section → override base URL.
   $("cursorExample").textContent =
 `# Cursor → Settings → Features → OpenAI API Key
-#   API Key:  not-needed
-#   Override OpenAI Base URL:  ${base}
+#   API Key:            mlxr-local
+#   Override Base URL:  ${base}
 
-# Or in .cursor/mcp.json for project-level:
-${JSON.stringify({ openai: { baseUrl: base, apiKey: "not-needed" } }, null, 2)}`;
+# Or drop a .cursor/config.json in your project root:
+${JSON.stringify({ openai: { baseUrl: base, apiKey: "mlxr-local" } }, null, 2)}`;
 
   // ── Continue (VS Code / JetBrains) ────────────────────────────────────────
   $("continueExample").textContent = JSON.stringify({
@@ -506,7 +516,7 @@ ${JSON.stringify({ openai: { baseUrl: base, apiKey: "not-needed" } }, null, 2)}`
         provider: "openai",
         model: name,
         apiBase: base,
-        apiKey: "not-needed",
+        apiKey: "mlxr-local",
       },
     ],
   }, null, 2);
@@ -516,12 +526,12 @@ ${JSON.stringify({ openai: { baseUrl: base, apiKey: "not-needed" } }, null, 2)}`
 `# One-off:
 aider \\
   --openai-api-base ${base} \\
-  --openai-api-key not-needed \\
+  --openai-api-key mlxr-local \\
   --model openai/${name}
 
 # Or persist in ~/.aider.conf.yml:
 openai-api-base: ${base}
-openai-api-key: not-needed
+openai-api-key: mlxr-local
 model: openai/${name}`;
 
   // ── Neovim / avante.nvim ──────────────────────────────────────────────────
@@ -532,7 +542,7 @@ require("avante").setup({
   openai = {
     endpoint = "${base}",
     model    = "${name}",
-    api_key  = "not-needed",
+    api_key  = "mlxr-local",
     max_tokens = 32768,
   },
 })`;
@@ -541,7 +551,7 @@ require("avante").setup({
   $("curlExample").textContent =
 `curl ${chat} \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer not-needed" \\
+  -H "Authorization: Bearer mlxr-local" \\
   -d '${JSON.stringify({ model: name, messages: [{ role: "user", content: "Hello!" }], stream: false })}'`;
 
   // ── OpenAI Python SDK ─────────────────────────────────────────────────────
