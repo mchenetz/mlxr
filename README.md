@@ -1,4 +1,4 @@
-# ◆ MLXr — Apple MLX Model Engine Manager
+# ◆ MLXr — MLX Model Engine Manager
 
 > The simplest way to run open-source AI models locally on Apple Silicon.  
 > One command, a browser dashboard, and an OpenAI-compatible API your existing tools can plug straight into.
