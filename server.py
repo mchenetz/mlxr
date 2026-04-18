@@ -1271,13 +1271,13 @@ class OAIChatRequest(BaseModel):
     model: Optional[str] = None
     messages: list[OAIMessage]
     # Accept both max_tokens (legacy) and max_completion_tokens (OpenAI v2).
-    # Zed and newer clients send max_completion_tokens.
-    max_tokens: Optional[int] = Field(default=None, ge=1, le=131072)
-    max_completion_tokens: Optional[int] = Field(default=None, ge=1, le=131072)
-    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # No bounds — the model's context window is the real limit.
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
+    temperature: Optional[float] = None  # pass-through; model clamps internally
+    top_p: Optional[float] = None
     stream: bool = False
-    stream_options: Optional[Any] = None  # ignored — accepted so validation doesn't fail
+    stream_options: Optional[Any] = None  # {"include_usage": bool}
     # Tool use. `tools` follows OpenAI's function-tool schema:
     #   [{"type": "function", "function": {"name": ..., "description": ..., "parameters": <JSON schema>}}]
     tools: Optional[list[dict]] = None
@@ -1288,6 +1288,12 @@ class OAIChatRequest(BaseModel):
     def effective_max_tokens(self) -> Optional[int]:
         """Prefer max_completion_tokens if set, fall back to max_tokens."""
         return self.max_completion_tokens or self.max_tokens
+
+    def include_usage(self) -> bool:
+        """Whether the client asked for a usage chunk at end of stream."""
+        if isinstance(self.stream_options, dict):
+            return bool(self.stream_options.get("include_usage"))
+        return False
 
 
 @app.get("/v1/models")
@@ -1424,7 +1430,7 @@ async def v1_chat_completions(req: OAIChatRequest):
             _oai_stream_chat(
                 cur, prompt, gen_req, model_id,
                 tools_active=tools_active, starts_in_think=starts_in_think,
-                entry_id=entry_id,
+                entry_id=entry_id, include_usage=req.include_usage(),
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -1453,12 +1459,13 @@ async def v1_chat_completions(req: OAIChatRequest):
         content_text = content + tail_content
         tool_calls = tools_in_stream + tail_tools
 
-    message: dict[str, Any] = {"role": "assistant"}
+    # Build the assistant message per OpenAI spec.
     cleaned = content_text.strip()
-    if cleaned or not tool_calls:
-        message["content"] = cleaned if cleaned else ""
-    else:
-        message["content"] = None
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": None if (tool_calls and not cleaned) else (cleaned or ""),
+        "refusal": None,  # required field in spec; null when not refusing
+    }
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -1474,11 +1481,13 @@ async def v1_chat_completions(req: OAIChatRequest):
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model_id,
+        "system_fingerprint": None,
         "choices": [
             {
                 "index": 0,
                 "message": message,
                 "finish_reason": finish_reason,
+                "logprobs": None,  # required field in spec; null when not requested
             }
         ],
         "usage": {
@@ -1598,7 +1607,7 @@ def _prompt_starts_in_think(prompt: str) -> bool:
 async def _oai_stream_chat(
     cur: LoadedModel, prompt: str, req: GenerateRequest, model_id: str,
     tools_active: bool = False, starts_in_think: bool = False,
-    entry_id: Optional[str] = None,
+    entry_id: Optional[str] = None, include_usage: bool = False,
 ) -> AsyncIterator[bytes]:
     """Stream chat.completion.chunk events in OpenAI's SSE format."""
     from mlx_lm import stream_generate
@@ -1615,7 +1624,13 @@ async def _oai_stream_chat(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_id,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            "system_fingerprint": None,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }],
         }
         return f"data: {json.dumps(payload)}\n\n".encode()
 
@@ -1694,8 +1709,10 @@ async def _oai_stream_chat(
             break
         if isinstance(item, dict) and "__error__" in item:
             log.warning("chat: id=%s stream error: %s", completion_id, item["__error__"])
-            yield chunk({}, finish_reason="error")
-            finish_reason = "error"
+            # "stop" is the only safe finish_reason for unexpected errors;
+            # "error" is not a valid OpenAI spec value and breaks strict clients.
+            yield chunk({}, finish_reason="stop")
+            finish_reason = "stop"
             break
         token_count += 1
         # Capture for diagnostics, up to cap.
@@ -1731,6 +1748,25 @@ async def _oai_stream_chat(
         finish_reason = "tool_calls"
 
     yield chunk({}, finish_reason=finish_reason)
+
+    # Optional usage chunk: spec says emit before [DONE] when include_usage=true.
+    # choices must be an empty array in this chunk per spec.
+    if include_usage:
+        usage_payload = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_id,
+            "system_fingerprint": None,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": token_count,
+                "total_tokens": token_count,
+            },
+        }
+        yield f"data: {json.dumps(usage_payload)}\n\n".encode()
+
     yield b"data: [DONE]\n\n"
 
     cur.generations += 1
