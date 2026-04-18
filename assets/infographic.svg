@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" width="900" height="420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a2540;stop-opacity:1" />
+      <stop offset="60%" style="stop-color:#0b0d12;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="btnGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#7aa2ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#4f7cff;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#4f7cff;stop-opacity:0.4" />
+      <stop offset="100%" style="stop-color:#7aa2ff;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#7aa2ff" opacity="0.9"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="420" fill="url(#bgGrad)" rx="16"/>
+  <!-- Subtle grid -->
+  <g opacity="0.04" stroke="#7aa2ff" stroke-width="1">
+    <line x1="0" y1="60" x2="900" y2="60"/><line x1="0" y1="120" x2="900" y2="120"/>
+    <line x1="0" y1="180" x2="900" y2="180"/><line x1="0" y1="240" x2="900" y2="240"/>
+    <line x1="0" y1="300" x2="900" y2="300"/><line x1="0" y1="360" x2="900" y2="360"/>
+    <line x1="150" y1="0" x2="150" y2="420"/><line x1="300" y1="0" x2="300" y2="420"/>
+    <line x1="450" y1="0" x2="450" y2="420"/><line x1="600" y1="0" x2="600" y2="420"/>
+    <line x1="750" y1="0" x2="750" y2="420"/>
+  </g>
+
+  <!-- Title -->
+  <text x="450" y="38" text-anchor="middle" fill="#7aa2ff" font-size="22" font-weight="700" filter="url(#glow)">◆ MLXr</text>
+  <text x="450" y="58" text-anchor="middle" fill="#8a93a6" font-size="12">Run any MLX model locally · OpenAI-compatible · Zero config</text>
+
+  <!-- ─── Box 1: HuggingFace ─── -->
+  <rect x="30" y="85" width="155" height="155" rx="12" fill="#141820" stroke="#242b38" stroke-width="1.5"/>
+  <rect x="30" y="85" width="155" height="34" rx="12" fill="#1b2029"/>
+  <rect x="30" y="107" width="155" height="12" fill="#1b2029"/>
+  <text x="107" y="107" text-anchor="middle" fill="#e6e9ef" font-size="12" font-weight="600">HuggingFace</text>
+  <text x="107" y="122" text-anchor="middle" fill="#8a93a6" font-size="10">1000s of MLX models</text>
+
+  <!-- HF icon rows -->
+  <rect x="46" y="133" width="123" height="22" rx="6" fill="#0a0c11" stroke="#242b38" stroke-width="1"/>
+  <text x="58" y="148" fill="#7aa2ff" font-size="10" font-family="monospace">mlx-community/Llama-3.2</text>
+  <rect x="46" y="160" width="123" height="22" rx="6" fill="#0a0c11" stroke="#242b38" stroke-width="1"/>
+  <text x="58" y="175" fill="#7aa2ff" font-size="10" font-family="monospace">mlx-community/Qwen3-35B</text>
+  <rect x="46" y="187" width="123" height="22" rx="6" fill="#0a0c11" stroke="#242b38" stroke-width="1"/>
+  <text x="58" y="202" fill="#7aa2ff" font-size="10" font-family="monospace">mlx-community/Phi-3.5-mini</text>
+  <text x="107" y="228" text-anchor="middle" fill="#8a93a6" font-size="10">Search · Download · Cache</text>
+
+  <!-- ─── Box 2: MLXr Engine (center) ─── -->
+  <rect x="238" y="72" width="185" height="270" rx="14" fill="#141820" stroke="#4f7cff" stroke-width="2"/>
+  <rect x="238" y="72" width="185" height="40" rx="14" fill="url(#btnGrad)"/>
+  <rect x="238" y="98" width="185" height="14" fill="url(#btnGrad)"/>
+  <text x="330" y="97" text-anchor="middle" fill="#0b0d12" font-size="14" font-weight="700">◆ MLXr Engine</text>
+  <text x="330" y="113" text-anchor="middle" fill="#0b0d12" font-size="10" font-weight="600">Apple MLX · Metal GPU</text>
+
+  <!-- Engine features -->
+  <g fill="#e6e9ef" font-size="11">
+    <text x="256" y="140">⚡ Streaming inference</text>
+    <text x="256" y="158">🔒 Metal crash prevention</text>
+    <text x="256" y="176">🧠 Reasoning block filter</text>
+    <text x="256" y="194">🔧 Tool-call parsing</text>
+    <text x="256" y="212">📦 Per-model settings</text>
+    <text x="256" y="230">🔄 Self-update via pip</text>
+    <text x="256" y="248">🖥  Live dashboard</text>
+  </g>
+
+  <!-- Endpoint badge -->
+  <rect x="252" y="262" width="152" height="28" rx="8" fill="#0a0c11" stroke="#3dd68c" stroke-width="1.5"/>
+  <text x="328" y="281" text-anchor="middle" fill="#3dd68c" font-size="11" font-weight="600">localhost:8000/v1</text>
+  <text x="328" y="318" text-anchor="middle" fill="#8a93a6" font-size="10">./run.sh  →  done</text>
+
+  <!-- ─── Box 3: AI Clients ─── -->
+  <rect x="480" y="85" width="390" height="260" rx="12" fill="#141820" stroke="#242b38" stroke-width="1.5"/>
+  <rect x="480" y="85" width="390" height="34" rx="12" fill="#1b2029"/>
+  <rect x="480" y="107" width="390" height="12" fill="#1b2029"/>
+  <text x="675" y="107" text-anchor="middle" fill="#e6e9ef" font-size="12" font-weight="600">AI Clients  —  OpenAI-Compatible</text>
+  <text x="675" y="121" text-anchor="middle" fill="#8a93a6" font-size="10">No API key · Any OpenAI SDK · Point to localhost:8000/v1</text>
+
+  <!-- Client cards — row 1 -->
+  <rect x="497" y="133" width="110" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="552" y="155" text-anchor="middle" fill="#7aa2ff" font-size="13">💻</text>
+  <text x="552" y="170" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">OpenCode</text>
+  <text x="552" y="182" text-anchor="middle" fill="#8a93a6" font-size="9">Agentic coding</text>
+
+  <rect x="617" y="133" width="110" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="672" y="155" text-anchor="middle" fill="#7aa2ff" font-size="13">🖊</text>
+  <text x="672" y="170" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">Cursor</text>
+  <text x="672" y="182" text-anchor="middle" fill="#8a93a6" font-size="9">AI code editor</text>
+
+  <rect x="737" y="133" width="116" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="795" y="155" text-anchor="middle" fill="#7aa2ff" font-size="13">🔗</text>
+  <text x="795" y="170" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">Continue</text>
+  <text x="795" y="182" text-anchor="middle" fill="#8a93a6" font-size="9">VS Code plugin</text>
+
+  <!-- Client cards — row 2 -->
+  <rect x="497" y="198" width="110" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="552" y="220" text-anchor="middle" fill="#7aa2ff" font-size="13">🌐</text>
+  <text x="552" y="235" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">OpenWebUI</text>
+  <text x="552" y="247" text-anchor="middle" fill="#8a93a6" font-size="9">Chat interface</text>
+
+  <rect x="617" y="198" width="110" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="672" y="220" text-anchor="middle" fill="#7aa2ff" font-size="13">📡</text>
+  <text x="672" y="235" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">OpenAI SDK</text>
+  <text x="672" y="247" text-anchor="middle" fill="#8a93a6" font-size="9">Python / Node.js</text>
+
+  <rect x="737" y="198" width="116" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="795" y="220" text-anchor="middle" fill="#7aa2ff" font-size="13">⚡</text>
+  <text x="795" y="235" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">Raycast AI</text>
+  <text x="795" y="247" text-anchor="middle" fill="#8a93a6" font-size="9">Launcher AI</text>
+
+  <!-- Client cards — row 3 -->
+  <rect x="497" y="263" width="110" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="552" y="285" text-anchor="middle" fill="#7aa2ff" font-size="13">💬</text>
+  <text x="552" y="300" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">LibreChat</text>
+  <text x="552" y="312" text-anchor="middle" fill="#8a93a6" font-size="9">Self-hosted chat</text>
+
+  <rect x="617" y="263" width="110" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="672" y="285" text-anchor="middle" fill="#7aa2ff" font-size="13">🦙</text>
+  <text x="672" y="300" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">LM Studio</text>
+  <text x="672" y="312" text-anchor="middle" fill="#8a93a6" font-size="9">Compatible format</text>
+
+  <rect x="737" y="263" width="116" height="54" rx="8" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="795" y="285" text-anchor="middle" fill="#7aa2ff" font-size="13">🔧</text>
+  <text x="795" y="300" text-anchor="middle" fill="#e6e9ef" font-size="11" font-weight="600">curl / any</text>
+  <text x="795" y="312" text-anchor="middle" fill="#8a93a6" font-size="9">Any HTTP client</text>
+
+  <!-- ─── Arrows ─── -->
+  <!-- HF → Engine -->
+  <line x1="186" y1="163" x2="236" y2="163" stroke="url(#arrowGrad)" stroke-width="2.5" marker-end="url(#arrowhead)" stroke-dasharray="5,3"/>
+  <text x="211" y="157" text-anchor="middle" fill="#8a93a6" font-size="9">download</text>
+
+  <!-- Engine → Clients -->
+  <line x1="424" y1="200" x2="477" y2="200" stroke="url(#arrowGrad)" stroke-width="2.5" marker-end="url(#arrowhead)"/>
+  <text x="450" y="194" text-anchor="middle" fill="#8a93a6" font-size="9">OpenAI API</text>
+
+  <!-- ─── Bottom bar ─── -->
+  <rect x="30" y="358" width="840" height="44" rx="10" fill="#1b2029" stroke="#242b38" stroke-width="1"/>
+  <text x="450" y="374" text-anchor="middle" fill="#8a93a6" font-size="10">Requirements</text>
+  <g fill="#e6e9ef" font-size="11">
+    <text x="90"  y="391">🍎 Apple Silicon</text>
+    <text x="240" y="391">🐍 Python 3.10+</text>
+    <text x="390" y="391">💾 8 GB RAM (min)</text>
+    <text x="560" y="391">✅ No cloud · 100% local</text>
+    <text x="720" y="391">🚀 One command</text>
+  </g>
+</svg>
