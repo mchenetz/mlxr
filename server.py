@@ -1237,26 +1237,57 @@ class OAIToolCall(BaseModel):
 class OAIMessage(BaseModel):
     role: str
     # Content is None for assistant messages that only contain tool_calls.
-    content: Optional[str] = None
+    # OpenAI allows content to be a string OR an array of content-part objects
+    # (e.g. [{"type": "text", "text": "..."}]). Zed's agent mode sends arrays.
+    # We accept Any here and normalise to str in the handler.
+    content: Optional[Any] = None
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
     tool_calls: Optional[list[OAIToolCall]] = None
+
+    def text_content(self) -> Optional[str]:
+        """Return content as a plain string regardless of whether the client
+        sent a str or an OpenAI-style content-parts array."""
+        if self.content is None:
+            return None
+        if isinstance(self.content, str):
+            return self.content
+        if isinstance(self.content, list):
+            # Extract text from content-parts: [{"type": "text", "text": "..."}, ...]
+            parts = []
+            for part in self.content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        parts.append(part.get("text") or "")
+                    elif part.get("type") == "image_url":
+                        pass  # silently skip images — model can't see them
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "".join(parts)
+        return str(self.content)
 
 
 class OAIChatRequest(BaseModel):
     model: Optional[str] = None
     messages: list[OAIMessage]
-    # OpenAI clients frequently request tens of thousands of tokens; the real
-    # limit is whatever the loaded model's context supports, so keep this
-    # generous. Still gated above zero to prevent accidental no-ops.
+    # Accept both max_tokens (legacy) and max_completion_tokens (OpenAI v2).
+    # Zed and newer clients send max_completion_tokens.
     max_tokens: Optional[int] = Field(default=None, ge=1, le=131072)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1, le=131072)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     stream: bool = False
+    stream_options: Optional[Any] = None  # ignored — accepted so validation doesn't fail
     # Tool use. `tools` follows OpenAI's function-tool schema:
     #   [{"type": "function", "function": {"name": ..., "description": ..., "parameters": <JSON schema>}}]
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None  # "auto" | "none" | "required" | {type, function}
+
+    model_config = {"extra": "ignore"}  # silently drop unknown fields (n, logprobs, etc.)
+
+    def effective_max_tokens(self) -> Optional[int]:
+        """Prefer max_completion_tokens if set, fall back to max_tokens."""
+        return self.max_completion_tokens or self.max_tokens
 
 
 @app.get("/v1/models")
@@ -1292,7 +1323,7 @@ async def v1_chat_completions(req: OAIChatRequest):
     saved = settings.get_model(cur.name)
     messages: list[dict] = []
     for m in req.messages:
-        entry: dict[str, Any] = {"role": m.role, "content": m.content if m.content is not None else ""}
+        entry: dict[str, Any] = {"role": m.role, "content": m.text_content() if m.content is not None else ""}
         if m.name:
             entry["name"] = m.name
         if m.tool_call_id:
@@ -1382,7 +1413,7 @@ async def v1_chat_completions(req: OAIChatRequest):
 
     gen_req = GenerateRequest(
         prompt="",  # not used for chat-template path
-        max_tokens=req.max_tokens if req.max_tokens is not None else saved.get("max_tokens", DEFAULT_GEN["max_tokens"]),
+        max_tokens=req.effective_max_tokens() if req.effective_max_tokens() is not None else saved.get("max_tokens", DEFAULT_GEN["max_tokens"]),
         temperature=req.temperature if req.temperature is not None else saved.get("temperature", DEFAULT_GEN["temperature"]),
         top_p=req.top_p if req.top_p is not None else saved.get("top_p", DEFAULT_GEN["top_p"]),
         stream=req.stream,
@@ -1819,11 +1850,23 @@ async def api_hf_delete(req: HFDeleteRequest) -> dict:
 
 
 @app.middleware("http")
-async def _no_cache_static(request, call_next):
-    """Disable caching for dashboard assets so edits show up on refresh.
-    API responses are untouched; this is just for the HTML/CSS/JS."""
-    response = await call_next(request)
+async def _request_logger(request, call_next):
+    """Log incoming /v1/ requests and any error responses so client issues are
+    visible in the server log without needing a separate proxy."""
     path = request.url.path
+    if path.startswith("/v1/"):
+        body = await request.body()
+        log.info("v1 request: %s %s body=%r", request.method, path, body[:1000] if body else b"")
+        # Stash the body so Starlette can re-read it (body stream is consumed).
+        from starlette.datastructures import Headers
+        from starlette.requests import Request as _Req
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        request = _Req(request.scope, receive)
+    response = await call_next(request)
+    if path.startswith("/v1/") and response.status_code >= 400:
+        log.warning("v1 response: %s %s → HTTP %d", request.method, path, response.status_code)
+    # Disable caching for dashboard assets.
     if not path.startswith("/api") and not path.startswith("/v1"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return response
