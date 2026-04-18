@@ -477,27 +477,32 @@ function renderEndpoint(modelName) {
   //   cmd+shift+p  →  "zed: set openai api key"  →  type: mlxr-local
   // OR export OPENAI_API_KEY=mlxr-local in your shell profile.
   // Then merge these keys into ~/.config/zed/settings.json:
-  $("zedExample").textContent =
-`// Step 1 — set a dummy API key (one-time, stored in keychain):
-//   cmd+shift+p → "zed: set openai api key" → mlxr-local
-// OR add to your shell profile:
-//   export OPENAI_API_KEY=mlxr-local
-
-// Step 2 — merge into ~/.config/zed/settings.json:
-${JSON.stringify({
+  $("zedExample").textContent = JSON.stringify({
     language_models: {
-      openai: {
-        api_url: base,
-        available_models: [
-          { name, display_name: shortName, max_tokens: 32768 },
-        ],
+      openai_compatible: {
+        MLXr: {
+          api_url: base,
+          available_models: [
+            {
+              name,
+              display_name: shortName,
+              max_tokens: 32768,
+              capabilities: {
+                tools: true,
+                images: false,
+                parallel_tool_calls: false,
+                prompt_cache_key: false,
+              },
+            },
+          ],
+        },
       },
     },
     assistant: {
-      default_model: { provider: "openai", model: name },
+      default_model: { provider: "openai_compatible", model: name },
       version: "2",
     },
-  }, null, 2)}`;
+  }, null, 2);
 
   // ── Cursor ────────────────────────────────────────────────────────────────
   $("cursorExample").textContent =
