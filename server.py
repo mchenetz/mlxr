@@ -609,11 +609,16 @@ class ThinkStripper:
         "<|mask_end|>",
         "<|turn_start|>",
         "<|turn_end|>",
-        # DeepSeek
-        "<｜begin▁of▁sentence｜>",
-        "<｜end▁of▁sentence｜>",
-        "<｜User｜>",
-        "<｜Assistant｜>",
+        # DeepSeek conversation tokens
+        "<\uff5cbegin\u2581of\u2581sentence\uff5c>",
+        "<\uff5cend\u2581of\u2581sentence\uff5c>",
+        "<\uff5cUser\uff5c>",
+        "<\uff5cAssistant\uff5c>",
+        # DeepSeek-V3 tool-call outer container tokens.  The inner per-call
+        # wrappers (<｜tool▁call▁begin｜> / <｜tool▁call▁end｜>) are consumed
+        # by ToolCallParser, so only the outer container markers are stripped here.
+        "<\uff5ctool\u2581calls\u2581begin\uff5c>",
+        "<\uff5ctool\u2581calls\u2581end\uff5c>",
     )
 
     def __init__(self, enabled: bool = True, starts_in_think: bool = False) -> None:
@@ -752,13 +757,25 @@ class ToolCallParser:
 
     # (open, close). All checked on every iteration; earliest match wins.
     TAG_PAIRS: tuple[tuple[str, str], ...] = (
+        # Qwen2.5 / Qwen3 / Hermes-3 / NousResearch / Gemma 3
         ("<tool_call>", "</tool_call>"),
+        # Phi-4-mini
         ("<|tool_call|>", "<|/tool_call|>"),
+        # Earlier Qwen / some fine-tunes
         ("<function_call>", "</function_call>"),
+        # Generic ASCII variants (kept for forward-compat)
         ("<tool_call_begin>", "<tool_call_end>"),
         ("<|tool_call_begin|>", "<|tool_call_end|>"),
+        # Mistral (no real close tag — close tag never appears; flush() handles it)
         ("[TOOL_CALLS]", "[/TOOL_CALLS]"),
+        # DeepSeek-V2/V3 individual call wrappers (Unicode fullwidth | + ▁ tokens).
+        # The outer <｜tool▁calls▁begin｜>/<｜tool▁calls▁end｜> container is stripped
+        # by ThinkStripper.STRAY_TOKENS so we only need to match the inner pair here.
+        ("<\uff5ctool\u2581call\u2581begin\uff5c>", "<\uff5ctool\u2581call\u2581end\uff5c>"),
     )
+
+    # DeepSeek-V3 body separator between call-type and function name.
+    _DS_SEP = "<\uff5ctool\u2581sep\uff5c>"
 
     _MAX_OPEN_LEN = max(len(o) for o, _ in TAG_PAIRS)
     _MAX_CLOSE_LEN = max(len(c) for _, c in TAG_PAIRS)
@@ -852,6 +869,11 @@ class ToolCallParser:
         text = text.strip()
         if not text:
             return []
+
+        # DeepSeek-V3: body is "function<｜tool▁sep｜>NAME\n```json\n{…}\n```"
+        if cls._DS_SEP in text:
+            return cls._parse_deepseek_body(text)
+
         # Fenced code block — unwrap first.
         if text.startswith("```"):
             stripped = text.strip("`")
@@ -886,6 +908,90 @@ class ToolCallParser:
 
         log.warning("tool_call body parse failed (tried JSON + XML) — raw: %r", text[:300])
         return []
+
+    @classmethod
+    def _parse_deepseek_body(cls, text: str) -> list[dict]:
+        """Parse a DeepSeek-V3/V2.5 individual tool-call body.
+
+        Format (after the outer <｜tool▁call▁begin｜> is stripped by the tag
+        pair matcher):
+
+            function<｜tool▁sep｜>FUNCTION_NAME
+            ```json
+            {"key": "value"}
+            ```
+
+        ``function`` is a literal type discriminator; the name and args follow
+        the separator.  Multiple calls are handled by the outer loop in
+        ToolCallParser.feed() which fires once per <｜tool▁call▁begin｜>…
+        <｜tool▁call▁end｜> pair.
+        """
+        sep_idx = text.find(cls._DS_SEP)
+        if sep_idx < 0:
+            return []
+        rest = text[sep_idx + len(cls._DS_SEP):]
+        nl_idx = rest.find("\n")
+        if nl_idx < 0:
+            fn_name = rest.strip()
+            fn_body = ""
+        else:
+            fn_name = rest[:nl_idx].strip()
+            fn_body = rest[nl_idx + 1:].strip()
+        # Strip optional fenced code block wrapper (```json … ```)
+        if fn_body.startswith("```"):
+            lines = fn_body.splitlines()
+            inner: list[str] = []
+            for line in lines[1:]:          # skip the ```json opener
+                if line.strip().startswith("```"):
+                    break
+                inner.append(line)
+            fn_body = "\n".join(inner).strip()
+        if not fn_name:
+            return []
+        try:
+            args = json.loads(fn_body) if fn_body else {}
+        except Exception:
+            log.warning("DeepSeek tool body JSON parse failed: %r", fn_body[:200])
+            args = {}
+        return [{
+            "id": f"call_{uuid.uuid4().hex[:20]}",
+            "type": "function",
+            "function": {
+                "name": fn_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        }]
+
+    @classmethod
+    def try_extract_raw_json(cls, content: str) -> list[dict]:
+        """Last-resort heuristic for models that emit bare JSON tool calls
+        with no wrapper tags — most notably Llama 3.2's default chat template,
+        which outputs ``{"name": "…", "parameters": {…}}`` directly.
+
+        We only convert to a tool call when ALL of these are true:
+        * The entire content (trimmed) is a single JSON object.
+        * The object has a "name" string key.
+        * The object has an "arguments" or "parameters" dict key.
+
+        This is strict enough to avoid false-positives for plain-text
+        responses that happen to contain JSON.
+        """
+        stripped = content.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            return []
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        if not isinstance(data.get("name"), str):
+            return []
+        has_args = "arguments" in data or "parameters" in data
+        if not has_args:
+            return []
+        tool = cls._make_tool(data)
+        return [tool] if tool else []
 
     # XML-style:
     #   <function=NAME>
@@ -1667,6 +1773,18 @@ async def v1_chat_completions(req: OAIChatRequest):
         tail_content, tail_tools = parser.flush()
         content_text = content + tail_content
         tool_calls = tools_in_stream + tail_tools
+        # Raw-JSON fallback: Llama 3.x and some other models emit a bare JSON
+        # object with no wrapper tags.  Only fires when the parser found no
+        # tagged tool calls and the entire output looks like a JSON tool call.
+        if not tool_calls and content_text:
+            fallback = ToolCallParser.try_extract_raw_json(content_text)
+            if fallback:
+                tool_calls = fallback
+                content_text = ""
+                log.info(
+                    "chat: id=%s raw-JSON tool call detected (Llama/bare-JSON fallback)",
+                    entry_id,
+                )
 
     # Build the assistant message per OpenAI spec.
     # content is null when: (a) tool_calls are present with no text, or
@@ -1903,6 +2021,19 @@ async def _oai_stream_chat(
     tools_emitted = 0
     finish_reason = "stop"
 
+    # Raw-JSON tool-call buffer — for models that emit bare JSON with no
+    # wrapper tags (Llama 3.x default chat template, Gemma 3 IT).
+    # When tools are active and the first visible character is '{', we hold
+    # back content until either we confirm it's NOT a JSON tool call (content
+    # starts with a non-'{' char, OR a recognised tag is seen, OR buffer
+    # overflows) and then stream normally, or the stream ends and we attempt
+    # a JSON parse.  For all wrapper-tag models this is a ~zero-overhead
+    # no-op: the first visible char is '<' (tag opener), so rj_streaming
+    # switches to True on the very first content chunk.
+    rj_buf: list[str] = []         # pending content while in detect/buffer mode
+    rj_streaming = not tools_active  # True → emit content chunks directly
+    RJ_BUF_MAX = 4096              # give up buffering beyond this many chars
+
     def emit_tool(tool: dict) -> bytes:
         """Emit a complete tool_call in one delta chunk. OpenAI clients that
         expect per-arg-chunk deltas still concatenate empty strings, so sending
@@ -1946,8 +2077,32 @@ async def _oai_stream_chat(
         if not visible:
             continue
         content, new_tools = tool_parser.feed(visible)
+        # If the tag-parser found a tagged tool call, switch to streaming mode
+        # (we know it's not a bare-JSON model) and flush any pending buffer.
+        if new_tools and not rj_streaming:
+            rj_streaming = True
+            if rj_buf:
+                yield chunk({"content": "".join(rj_buf)})
+                rj_buf.clear()
         if content:
-            yield chunk({"content": content})
+            if rj_streaming:
+                yield chunk({"content": content})
+            else:
+                # Decide on streaming vs. buffering using the first visible char.
+                combined = "".join(rj_buf) + content
+                first_visible = combined.lstrip()
+                if first_visible and first_visible[0] != "{":
+                    # Not a JSON tool call — stream from now on.
+                    rj_streaming = True
+                    yield chunk({"content": combined})
+                    rj_buf.clear()
+                else:
+                    rj_buf.append(content)
+                    if len("".join(rj_buf)) > RJ_BUF_MAX:
+                        # Buffer too large — treat as plain content.
+                        rj_streaming = True
+                        yield chunk({"content": "".join(rj_buf)})
+                        rj_buf.clear()
         for t in new_tools:
             yield emit_tool(t)
             tools_emitted += 1
@@ -1956,17 +2111,51 @@ async def _oai_stream_chat(
     stripper_tail = stripper.flush()
     if stripper_tail:
         content, new_tools = tool_parser.feed(stripper_tail)
+        if new_tools and not rj_streaming:
+            rj_streaming = True
+            if rj_buf:
+                yield chunk({"content": "".join(rj_buf)})
+                rj_buf.clear()
         if content:
-            yield chunk({"content": content})
+            if rj_streaming:
+                yield chunk({"content": content})
+            else:
+                rj_buf.append(content)
         for t in new_tools:
             yield emit_tool(t)
             tools_emitted += 1
+
     parser_tail, trailing_tools = tool_parser.flush()
     if parser_tail:
-        yield chunk({"content": parser_tail})
+        if rj_streaming:
+            yield chunk({"content": parser_tail})
+        else:
+            rj_buf.append(parser_tail)
     for t in trailing_tools:
+        if not rj_streaming:
+            rj_streaming = True
+            if rj_buf:
+                yield chunk({"content": "".join(rj_buf)})
+                rj_buf.clear()
         yield emit_tool(t)
         tools_emitted += 1
+
+    # Raw-JSON fallback for bare-JSON models (Llama 3.x etc.).
+    if rj_buf and not rj_streaming and tools_emitted == 0:
+        full_content = "".join(rj_buf)
+        rj_buf.clear()
+        fallback = ToolCallParser.try_extract_raw_json(full_content)
+        if fallback:
+            log.info(
+                "chat: id=%s raw-JSON tool call detected in stream (Llama/bare-JSON fallback)",
+                completion_id,
+            )
+            for t in fallback:
+                yield emit_tool(t)
+                tools_emitted += 1
+        else:
+            # It was just plain content that happened to start with '{'.
+            yield chunk({"content": full_content})
 
     if tools_emitted and finish_reason == "stop":
         finish_reason = "tool_calls"
