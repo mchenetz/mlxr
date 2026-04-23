@@ -28,6 +28,18 @@ from pydantic import BaseModel, Field
 log = logging.getLogger("mlxr")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+# Suppress uvicorn access-log spam from the dashboard's polling loops.
+# /api/status and /api/hf/downloads are hit every 2-3 seconds; they clutter
+# the log and make real events (tool calls, errors, model loads) hard to find.
+_POLL_PATHS = frozenset(["/api/status", "/api/hf/downloads"])
+
+class _PollFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p in msg for p in _POLL_PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(_PollFilter())
+
 STATIC_DIR = Path(__file__).parent / "static"
 SETTINGS_PATH = Path(os.environ.get("MLXR_SETTINGS_PATH", str(Path.home() / ".mlxr" / "settings.json")))
 
