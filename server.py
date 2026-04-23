@@ -1158,13 +1158,27 @@ MIN_PYTHON = (3, 10)
 
 
 def _engine_versions() -> dict:
+    # Use importlib.metadata rather than importing each module and reading
+    # __version__.  importlib.metadata reads from the installed .dist-info
+    # directory on disk, so it reflects what pip just wrote *without* needing
+    # a process restart — critical for the "check versions after upgrade" flow.
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+
+    # (module-attr-key → PyPI package name)
+    _PKG_MAP = {
+        "mlx":             "mlx",
+        "mlx_lm":          "mlx-lm",
+        "huggingface_hub": "huggingface-hub",
+        "transformers":    "transformers",
+    }
     out: dict[str, Any] = {}
-    for mod in ("mlx", "mlx_lm", "huggingface_hub", "transformers"):
+    for mod_key, pkg_name in _PKG_MAP.items():
         try:
-            m = __import__(mod)
-            out[mod] = getattr(m, "__version__", "unknown")
+            out[mod_key] = _pkg_version(pkg_name)
+        except PackageNotFoundError:
+            out[mod_key] = "not installed"
         except Exception as e:
-            out[mod] = f"not installed ({e.__class__.__name__})"
+            out[mod_key] = f"not installed ({e.__class__.__name__})"
     out["python"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     out["python_too_old"] = sys.version_info < MIN_PYTHON
     out["python_min"] = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
