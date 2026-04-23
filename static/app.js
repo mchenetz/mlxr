@@ -268,16 +268,36 @@ async function hfDownload(repoId) {
     await api("/api/hf/download", { method: "POST", body: JSON.stringify({ name: repoId }) });
     toast(`Download started: ${repoId}`, "ok");
     refreshDownloads();
+    // Kick off fast-polling now that we know a download is active.
+    _scheduleDownloadPoll(true);
   } catch (e) {
     toast(`Download failed: ${e.message}`, "err");
   }
 }
 
+let _dlPollInterval = null;
+
 async function refreshDownloads() {
   try {
     const r = await api("/api/hf/downloads");
-    renderDownloads(r.jobs || []);
+    const jobs = r.jobs || [];
+    renderDownloads(jobs);
+    // Only keep fast-polling while a download is actually running.
+    const hasActive = jobs.some(j => j.status === "running" || j.status === "pending");
+    _scheduleDownloadPoll(hasActive);
   } catch {}
+}
+
+function _scheduleDownloadPoll(active) {
+  // active download → poll every 1.5 s; idle → stop polling entirely
+  // (the user can always hit "Refresh cache" manually, or start a download)
+  const wantInterval = active ? 1500 : null;
+  if (_dlPollInterval && !active) {
+    clearInterval(_dlPollInterval);
+    _dlPollInterval = null;
+  } else if (!_dlPollInterval && active) {
+    _dlPollInterval = setInterval(refreshDownloads, 1500);
+  }
 }
 
 function renderDownloads(jobs) {
@@ -768,4 +788,5 @@ refreshCache();
 refreshDownloads();
 checkUpdates();
 setInterval(refreshStatus, 2500);
-setInterval(refreshDownloads, 1500);
+// Download polling is adaptive: starts automatically when a download begins,
+// stops when all downloads are done. No constant background noise when idle.
