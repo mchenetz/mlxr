@@ -1496,6 +1496,45 @@ async def v1_chat_completions(req: OAIChatRequest):
     # the template doesn't advertise any.
     tools_for_template = req.tools if (req.tools and req.tool_choice != "none") else None
 
+    # Enforce tool_choice="required" and tool_choice={"function":{"name":"X"}}.
+    #
+    # Most open-source chat templates (including Qwen3's) don't have a native
+    # tool_choice concept — the IMPORTANT reminder allows the model to skip
+    # tool calls entirely. We enforce it by injecting a system instruction that
+    # overrides that allowance. This is appended AFTER any existing system
+    # message so it appears closest to the generation point and isn't buried.
+    if tools_for_template and req.tool_choice and req.tool_choice not in ("auto", "none"):
+        if req.tool_choice == "required":
+            tool_names_str = ", ".join(
+                t.get("function", {}).get("name", "") for t in tools_for_template
+            )
+            enforcement = (
+                f"You MUST respond by calling one of the available tools "
+                f"({tool_names_str}). Do NOT answer in plain text — a tool call "
+                f"is required for this turn."
+            )
+        elif isinstance(req.tool_choice, dict):
+            forced_name = (req.tool_choice.get("function") or {}).get("name", "")
+            if forced_name:
+                enforcement = (
+                    f"You MUST call the '{forced_name}' tool on this turn. "
+                    f"Do not answer in plain text."
+                )
+            else:
+                enforcement = None
+        else:
+            enforcement = None
+
+        if enforcement:
+            # Insert immediately before the final user turn so it's in scope.
+            # If there's already a trailing system message we update it; otherwise
+            # we append a fresh one.
+            if messages and messages[-1]["role"] == "system":
+                messages[-1]["content"] = messages[-1]["content"] + "\n\n" + enforcement
+            else:
+                messages.append({"role": "system", "content": enforcement})
+            log.info("chat: tool_choice=%r — injected enforcement instruction", req.tool_choice)
+
     # enable_thinking resolution: saved setting → auto (False if tools else True).
     saved_enable_thinking = saved.get("enable_thinking")
     if saved_enable_thinking is None:
@@ -1609,10 +1648,13 @@ async def v1_chat_completions(req: OAIChatRequest):
         tool_calls = tools_in_stream + tail_tools
 
     # Build the assistant message per OpenAI spec.
+    # content is null when: (a) tool_calls are present with no text, or
+    # (b) the model generated nothing visible (all output was stripped thinking
+    # blocks). Returning "" in case (b) confuses clients — null is cleaner.
     cleaned = content_text.strip()
     message: dict[str, Any] = {
         "role": "assistant",
-        "content": None if (tool_calls and not cleaned) else (cleaned or ""),
+        "content": cleaned if cleaned else None,
         "refusal": None,  # required field in spec; null when not refusing
     }
     if tool_calls:
