@@ -667,14 +667,17 @@ async function checkUpdates() {
     const r = await api("/api/engine/check");
     lastCheck = r;
     renderEngineVersions(r.packages);
-    // If Python is too old, upgrading in-place won't actually move mlx-lm forward.
     const pythonTooOld = r.python_too_old === true;
-    $("upgradeBtn").disabled = !r.update_available || pythonTooOld;
+    const actionable = (r.update_available || r.install_available) && !pythonTooOld;
+    $("upgradeBtn").disabled = !actionable;
+    $("upgradeBtn").textContent = r.install_available ? "Install missing" : "Update MLX";
     $("engineHint").textContent = pythonTooOld
       ? "Python is too old — recreate .venv before upgrading."
-      : r.update_available
-        ? "Updates available."
-        : "All up to date.";
+      : r.install_available
+        ? "Some packages are not installed."
+        : r.update_available
+          ? "Updates available."
+          : "All up to date.";
   } catch (e) {
     $("engineHint").textContent = `Check failed: ${e.message}`;
   } finally {
@@ -687,14 +690,65 @@ function renderEngineVersions(pkgs) {
   table.innerHTML = "";
   for (const [name, info] of Object.entries(pkgs)) {
     const tr = document.createElement("tr");
-    const status = info.update_available
-      ? `<span class="badge warn">update: ${escapeHtml(info.latest)}</span>`
-      : (info.installed === info.latest ? `<span class="badge ok">latest</span>` : `<span class="badge">—</span>`);
+    let statusCell;
+    if (info.missing) {
+      statusCell = `<span class="badge err">not installed</span>
+        <button class="install-pkg" data-pkg="${escapeHtml(name)}" style="margin-left:6px;font-size:11px;padding:3px 8px;">Install</button>`;
+    } else if (info.update_available) {
+      statusCell = `<span class="badge warn">update: ${escapeHtml(info.latest)}</span>`;
+    } else {
+      statusCell = `<span class="badge ok">latest</span>`;
+    }
     tr.innerHTML = `
       <td class="pkg">${escapeHtml(name)}</td>
-      <td class="ver">${escapeHtml(info.installed)}${info.latest ? " · latest " + escapeHtml(info.latest) : ""}</td>
-      <td class="status">${status}</td>`;
+      <td class="ver">${info.missing ? "—" : escapeHtml(info.installed)}${!info.missing && info.latest ? " · latest " + escapeHtml(info.latest) : ""}</td>
+      <td class="status">${statusCell}</td>`;
     table.appendChild(tr);
+  }
+  // Per-row Install buttons
+  table.querySelectorAll("button.install-pkg").forEach(btn => {
+    btn.addEventListener("click", () => installPackage(btn.dataset.pkg));
+  });
+}
+
+async function installPackage(pkgName) {
+  if (!confirm(`Install ${pkgName} into the server's venv?`)) return;
+  const log = $("engineLog");
+  log.classList.remove("hidden");
+  log.textContent = "";
+  $("upgradeBtn").disabled = true;
+  $("checkUpdatesBtn").disabled = true;
+  $("restartBtn").disabled = true;
+  let rc = null;
+  try {
+    const res = await fetch("/api/engine/upgrade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ packages: [pkgName] }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    await consumeSSE(res, (event, obj) => {
+      if (event === "start")       { log.textContent += `$ ${obj.cmd.join(" ")}\n\n`; }
+      else if (event === "done")   { rc = obj.returncode; log.textContent += `\n--- exit ${rc} ---\n`; }
+      else if (event === "error")  { log.textContent += `\nERROR: ${obj.error || "stream error"}\n`; }
+      else if (obj.line != null)   { log.textContent += obj.line + "\n"; log.scrollTop = log.scrollHeight; }
+    });
+    if (rc === 0) {
+      toast(`${pkgName} installed — restart to apply.`, "ok");
+      $("engineHint").textContent = "Install done. Click Restart to load the new version.";
+    } else {
+      toast(`pip exited with ${rc}`, "err");
+    }
+  } catch (e) {
+    toast(`Install failed: ${e.message}`, "err");
+    log.textContent += `\nFAILED: ${e.message}\n`;
+  } finally {
+    $("checkUpdatesBtn").disabled = false;
+    $("restartBtn").disabled = false;
+    checkUpdates();
   }
 }
 

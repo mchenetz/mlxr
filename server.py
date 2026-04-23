@@ -1119,10 +1119,19 @@ async def api_engine_check() -> dict:
             except Exception:
                 update = inst != latest
         any_update = any_update or update
-        result[pkg] = {"installed": inst, "latest": latest, "update_available": update}
+        missing = inst.startswith("not installed")
+        result[pkg] = {
+            "installed": inst,
+            "latest": latest,
+            "update_available": update,
+            "missing": missing,
+        }
+        any_update = any_update or update
+    any_missing = any(v["missing"] for v in result.values())
     return {
         "packages": result,
         "update_available": any_update,
+        "install_available": any_missing,
         "python": installed.get("python"),
         "python_too_old": bool(installed.get("python_too_old")),
         "python_min": installed.get("python_min"),
