@@ -69,8 +69,9 @@ function renderStatus(s) {
   if (vPill) {
     const vm = versions.mlx || "?";
     const vlm = versions.mlx_lm || "?";
+    const vvlm = versions.mlx_vlm && !versions.mlx_vlm.startsWith("not") ? ` · mlx-vlm ${versions.mlx_vlm}` : "";
     const py = versions.python ? ` · py ${versions.python}` : "";
-    vPill.textContent = `mlx ${vm} · mlx-lm ${vlm}${py}`;
+    vPill.textContent = `mlx ${vm} · mlx-lm ${vlm}${vvlm}${py}`;
     vPill.title = Object.entries(versions).map(([k, v]) => `${k}: ${v}`).join("\n");
     vPill.classList.toggle("error", !!versions.python_too_old);
   }
@@ -78,8 +79,9 @@ function renderStatus(s) {
 
   const ttftStr = m.last_ttft != null ? `${(m.last_ttft * 1000).toFixed(0)} ms` : "—";
   const tpsStr  = m.last_tps  != null ? `${m.last_tps.toFixed(1)} tok/s` : "—";
+  const modelTypeStr = m.is_vlm ? " (VLM — vision enabled)" : "";
   $("modelInfo").textContent = m.loaded
-    ? `name:           ${m.name}
+    ? `name:           ${m.name}${modelTypeStr}
 context_length: ${m.context_length != null ? m.context_length.toLocaleString() + " tokens" : "unknown"}
 uptime:         ${fmtSeconds(m.uptime_seconds)}
 generations:    ${m.generations}

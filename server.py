@@ -47,10 +47,11 @@ SETTINGS_PATH = Path(os.environ.get("MLXR_SETTINGS_PATH", str(Path.home() / ".ml
 
 # Only these packages may be upgraded via the dashboard. Prevents the API from
 # being abused to `pip install` arbitrary things.
-ALLOWED_UPGRADE_PACKAGES = ("mlx", "mlx-lm", "huggingface_hub", "transformers")
+ALLOWED_UPGRADE_PACKAGES = ("mlx", "mlx-lm", "mlx-vlm", "huggingface_hub", "transformers")
 PACKAGE_TO_MODULE = {
     "mlx": "mlx",
     "mlx-lm": "mlx_lm",
+    "mlx-vlm": "mlx_vlm",
     "huggingface_hub": "huggingface_hub",
     "transformers": "transformers",
 }
@@ -1558,10 +1559,12 @@ def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest,
     accept them.  Always falls back to the bare temp= kwarg path when
     make_sampler itself is unavailable.
 
-    When cur.is_vlm and images are provided, delegates to _make_vlm_iterator.
+    When cur.is_vlm, always delegates to _make_vlm_iterator (which uses
+    mlx_vlm.stream_generate so the vision encoder is wired up correctly even
+    for text-only turns).
     """
-    if cur.is_vlm and images:
-        return _make_vlm_iterator(cur, prompt, req, list(images))
+    if cur.is_vlm:
+        return _make_vlm_iterator(cur, prompt, req, list(images) if images else [])
 
     from mlx_lm import stream_generate
 
@@ -1604,65 +1607,102 @@ def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest,
 
 
 def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: list):
-    """Build a VLM stream iterator using mlx_vlm.stream_generate."""
+    """Build a VLM stream iterator using mlx_vlm.stream_generate.
+
+    Passes image URLs/paths directly as strings — mlx_vlm ≥0.4 handles
+    loading and resizing internally.  Falls back to text-only generation if
+    mlx-vlm is not installed or no loadable images remain.
+    """
     try:
         from mlx_vlm import stream_generate as vlm_stream
-        from mlx_vlm.utils import load_image
     except ImportError:
         log.warning("mlx-vlm not installed — falling back to text-only generation")
         return _make_iterator(cur, prompt, req)
 
-    img_objs = []
-    for url in images:
-        try:
-            img_objs.append(load_image(url))
-        except Exception as e:
-            log.warning("Failed to load image %s: %s", url, e)
+    # Filter out any blank/None entries; keep raw URL strings.
+    valid_images = [u for u in images if u]
 
-    if not img_objs:
-        return _make_iterator(cur, prompt, req)
+    gen_kwargs: dict[str, Any] = {
+        "max_tokens": req.max_tokens,
+        "temp": req.temperature,
+        "top_p": req.top_p,
+    }
+    if req.repetition_penalty is not None:
+        gen_kwargs["repetition_penalty"] = req.repetition_penalty
+
+    image_arg: Any = None
+    if valid_images:
+        image_arg = valid_images[0] if len(valid_images) == 1 else valid_images
+        log.info("vlm: generating with %d image(s)", len(valid_images))
 
     return vlm_stream(
         cur.model, cur.tokenizer, prompt,
-        image=img_objs[0] if len(img_objs) == 1 else img_objs,
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
+        image=image_arg,
+        **gen_kwargs,
     )
 
 
 def _render_vlm_prompt(cur: LoadedModel, messages: list[dict], images: list) -> str:
-    """Build a VLM-formatted prompt string."""
+    """Build a VLM-formatted prompt string using mlx_vlm.apply_chat_template.
+
+    Passes the full multi-turn messages list so that system prompts and prior
+    conversation turns are preserved.  Image tokens are injected by the template
+    into the final user turn based on num_images.
+    """
     try:
-        from mlx_vlm.prompt_utils import apply_chat_template as vlm_tmpl
-        # Extract last user text for the VLM prompt
-        user_text = next(
-            (m["content"] for m in reversed(messages) if m["role"] == "user"),
-            ""
+        from mlx_vlm import apply_chat_template as vlm_tmpl
+        # Build message list in the format apply_chat_template expects:
+        # list of dicts with "role" and "content" keys.  VLM template will
+        # inject image placeholder tokens into the last non-system/assistant turn.
+        msg_list = [{"role": m["role"], "content": m.get("content") or ""} for m in messages]
+        return vlm_tmpl(
+            cur.tokenizer,
+            cur.model.config,
+            msg_list,
+            num_images=len(images),
         )
-        return vlm_tmpl(cur.tokenizer, cur.model.config, user_text, num_images=len(images))
     except Exception as e:
         log.warning("VLM apply_chat_template failed (%s), falling back to regular template", e)
         return _render_chat(cur.tokenizer, messages)
 
 
 def _extract_images(messages: list[dict]) -> tuple[list[dict], list[str]]:
-    """Strip image_url content parts out of messages, return (clean_msgs, urls)."""
+    """Strip image_url content parts out of messages, return (clean_msgs, urls).
+
+    Handles both http(s) URLs and data: URIs (base64-encoded images).
+    Multi-part content blocks are collapsed into plain text strings so that
+    downstream code that doesn't understand multimodal content still works.
+    """
     clean, urls = [], []
     for m in messages:
         content = m.get("content")
         if isinstance(content, list):
-            parts, img_urls = [], []
+            parts: list[str] = []
+            msg_urls: list[str] = []
             for p in content:
-                if isinstance(p, dict):
-                    if p.get("type") == "text":
-                        parts.append(p.get("text", ""))
-                    elif p.get("type") == "image_url":
-                        u = p.get("image_url") or {}
-                        url = u.get("url", "") if isinstance(u, dict) else str(u)
+                if not isinstance(p, dict):
+                    continue
+                ptype = p.get("type", "")
+                if ptype == "text":
+                    parts.append(p.get("text", ""))
+                elif ptype == "image_url":
+                    u = p.get("image_url") or {}
+                    url = u.get("url", "") if isinstance(u, dict) else str(u)
+                    if url:
+                        msg_urls.append(url)
+                elif ptype == "image":
+                    # Anthropic-style inline image block
+                    src = p.get("source") or {}
+                    if src.get("type") == "base64":
+                        media = src.get("media_type", "image/jpeg")
+                        data = src.get("data", "")
+                        msg_urls.append(f"data:{media};base64,{data}")
+                    elif src.get("type") == "url":
+                        url = src.get("url", "")
                         if url:
-                            img_urls.append(url)
-            urls.extend(img_urls)
-            clean.append({**m, "content": "".join(parts)})
+                            msg_urls.append(url)
+            urls.extend(msg_urls)
+            clean.append({**m, "content": " ".join(p for p in parts if p).strip()})
         else:
             clean.append(m)
     return clean, urls
@@ -1705,6 +1745,7 @@ def _engine_versions() -> dict:
     _PKG_MAP = {
         "mlx":             "mlx",
         "mlx_lm":          "mlx-lm",
+        "mlx_vlm":         "mlx-vlm",
         "huggingface_hub": "huggingface-hub",
         "transformers":    "transformers",
     }
@@ -2547,7 +2588,10 @@ async def v1_chat_completions(req: OAIChatRequest):
     else:
         enable_thinking = bool(saved_enable_thinking)
 
-    if cur.is_vlm and image_urls:
+    if cur.is_vlm:
+        # Always use the VLM chat template — even text-only requests should go
+        # through apply_chat_template so image token slots are handled correctly
+        # and the model's own chat format is respected.
         prompt = _render_vlm_prompt(cur, messages, image_urls)
     else:
         prompt = _render_chat(
