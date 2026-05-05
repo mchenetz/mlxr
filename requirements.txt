@@ -5,3 +5,9 @@ mlx>=0.21
 mlx-lm>=0.21
 psutil>=5.9
 huggingface_hub>=0.23
+
+# Optional: VLM support (Qwen3.5-VL, GLM-4V, Pixtral, etc.)
+# pip install mlx-vlm
+
+# Optional: macOS menu bar app (python menubar.py)
+# pip install rumps

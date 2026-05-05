@@ -65,6 +65,9 @@ SUGGESTED_MODELS = [
 ]
 
 
+MLXR_MAX_MODELS = max(1, int(os.environ.get("MLXR_MAX_MODELS", "1")))
+
+
 @dataclass
 class LoadedModel:
     name: str
@@ -78,6 +81,7 @@ class LoadedModel:
     # Per-generation perf metrics updated after each inference call.
     last_ttft: Optional[float] = None   # Time To First Token (seconds)
     last_tps: Optional[float] = None    # tokens / second (generation throughput)
+    is_vlm: bool = False
 
 
 def _detect_context_length(tokenizer: Any, model_name: str) -> int:
@@ -113,18 +117,85 @@ def _detect_context_length(tokenizer: Any, model_name: str) -> int:
     return 32768
 
 
-class Engine:
-    """Thread-safe holder for the currently-loaded MLX model."""
+def _clear_mlx_cache() -> None:
+    """Ask MLX to release Metal buffer cache. Silently ignored if MLX is not installed."""
+    try:
+        import mlx.core as mx
+        mx.metal.clear_cache()
+    except Exception:
+        pass
+
+
+# ---- VLM helpers ---------------------------------------------------------
+
+_VLM_CONFIG_KEYS = frozenset([
+    "vision_config", "visual_config", "image_token_id",
+    "num_image_tokens", "pixel_values_videos", "visual_token_id",
+    "image_seq_length", "vision_tower",
+])
+
+
+def _is_vlm_model(name: str) -> bool:
+    """Check model config.json for VLM indicators. Returns False on any error."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        cfg_path = try_to_load_from_cache(name, "config.json")
+        if cfg_path:
+            cfg = json.loads(open(cfg_path).read())
+            return bool(_VLM_CONFIG_KEYS & set(cfg.keys()))
+    except Exception:
+        pass
+    return False
+
+
+def _load_llm(name: str) -> LoadedModel:
+    from mlx_lm import load as mlx_load
+    model, tokenizer = mlx_load(name)
+    auto_ctx = _detect_context_length(tokenizer, name)
+    saved_ctx = settings.get_model(name).get("context_length")
+    ctx = int(saved_ctx) if saved_ctx else auto_ctx
+    log.info("Context length for %s: %d%s", name, ctx, " (overridden)" if saved_ctx else " (auto)")
+    return LoadedModel(name=name, loaded_at=time.time(), model=model, tokenizer=tokenizer, context_length=ctx)
+
+
+def _load_vlm(name: str) -> LoadedModel:
+    try:
+        from mlx_vlm import load as vlm_load
+    except ImportError:
+        raise RuntimeError(
+            f"{name} appears to be a VLM but mlx-vlm is not installed. "
+            "Run: pip install mlx-vlm"
+        )
+    model, processor = vlm_load(name)
+    tokenizer = getattr(processor, "tokenizer", processor)
+    auto_ctx = _detect_context_length(tokenizer, name)
+    saved_ctx = settings.get_model(name).get("context_length")
+    ctx = int(saved_ctx) if saved_ctx else auto_ctx
+    log.info("VLM context length for %s: %d", name, ctx)
+    return LoadedModel(
+        name=name, loaded_at=time.time(),
+        model=model, tokenizer=processor,   # store full processor as tokenizer
+        context_length=ctx, is_vlm=True,
+    )
+
+
+class EnginePool:
+    """LRU pool of loaded MLX models.
+
+    MLXR_MAX_MODELS controls capacity (default 1, preserving backward compat).
+    A single _gen_lock serialises ALL inference across ALL models — MLX/Metal
+    crashes with concurrent eval() calls.
+    """
 
     def __init__(self) -> None:
         self._lock = Lock()
-        # Serializes all MLX inference calls. MLX / Apple's Metal driver can
-        # crash (SIGSEGV in AGXMetalG17X) when two threads run eval() on the
-        # same model concurrently — which happens as soon as a second HTTP
-        # request arrives mid-generation. Keep inference strictly one-at-a-time.
+        # Single gen lock shared across all models — Metal requirement.
         self._gen_lock = Lock()
-        self._current: Optional[LoadedModel] = None
+        # canonical name → LoadedModel, insertion order = load order
+        self._models: dict[str, LoadedModel] = {}
         self._loading: Optional[str] = None
+
+    # ---- properties (backward compat) ------------------------------------
 
     @property
     def gen_lock(self) -> Lock:
@@ -132,40 +203,70 @@ class Engine:
 
     @property
     def current(self) -> Optional[LoadedModel]:
-        return self._current
+        """Most recently used model (first in reverse-insertion order)."""
+        with self._lock:
+            if not self._models:
+                return None
+            # Return the model with the highest last_used timestamp.
+            return max(self._models.values(), key=lambda m: m.last_used)
 
     @property
     def loading(self) -> Optional[str]:
         return self._loading
 
-    def load(self, name: str) -> LoadedModel:
-        # mlx_lm is imported lazily so the server starts even if MLX is missing.
-        from mlx_lm import load as mlx_load
+    # ---- public API ------------------------------------------------------
 
+    def get(self, name: str) -> Optional[LoadedModel]:
+        """Look up by canonical name or alias."""
+        if not name:
+            return None
+        with self._lock:
+            if name in self._models:
+                return self._models[name]
+            # Check aliases
+            for m in self._models.values():
+                saved = settings.get_model(m.name)
+                if saved.get("alias") == name:
+                    return m
+        return None
+
+    def loaded_models(self) -> list[LoadedModel]:
+        """All loaded models, newest-used first."""
+        with self._lock:
+            return sorted(self._models.values(), key=lambda m: m.last_used, reverse=True)
+
+    def load(self, name: str) -> LoadedModel:
+        """Load a model into the pool, evicting LRU if at capacity."""
         with self._lock:
             if self._loading:
                 raise RuntimeError(f"Another load is in progress: {self._loading}")
-            if self._current and self._current.name == name:
-                return self._current
+            if name in self._models:
+                # Already loaded — bump last_used and return.
+                m = self._models[name]
+                m.last_used = time.time()
+                return m
             self._loading = name
 
         try:
+            # Evict LRU models until we're below capacity.
+            with self._lock:
+                while len(self._models) >= MLXR_MAX_MODELS:
+                    lru_name = min(self._models, key=lambda k: self._models[k].last_used)
+                    log.info("Pool full — evicting LRU model %s", lru_name)
+                    del self._models[lru_name]
+
             log.info("Loading model %s", name)
             t0 = time.time()
-            model, tokenizer = mlx_load(name)
+            is_vlm = _is_vlm_model(name)
+            if is_vlm:
+                log.info("Detected VLM architecture for %s", name)
+                loaded = _load_vlm(name)
+            else:
+                loaded = _load_llm(name)
             log.info("Loaded %s in %.1fs", name, time.time() - t0)
-            # Detect context window; honour per-model override from settings.
-            auto_ctx = _detect_context_length(tokenizer, name)
-            saved_ctx = settings.get_model(name).get("context_length")
-            ctx = int(saved_ctx) if saved_ctx else auto_ctx
-            log.info("Context length for %s: %d%s", name, ctx,
-                     " (overridden in settings)" if saved_ctx else " (auto-detected)")
-            loaded = LoadedModel(
-                name=name, loaded_at=time.time(),
-                model=model, tokenizer=tokenizer, context_length=ctx,
-            )
+
             with self._lock:
-                self._current = loaded
+                self._models[name] = loaded
                 self._loading = None
             return loaded
         except Exception:
@@ -173,18 +274,30 @@ class Engine:
                 self._loading = None
             raise
 
-    def unload(self) -> bool:
+    def unload(self, name: Optional[str] = None) -> bool:
+        """Unload by canonical name/alias, or the LRU model if name is None."""
         with self._lock:
-            if not self._current:
+            if not self._models:
                 return False
-            self._current = None
-        # Let MLX reclaim buffers.
-        try:
-            import mlx.core as mx
-
-            mx.metal.clear_cache()
-        except Exception:
-            pass
+            if name is None:
+                # Unload LRU
+                target = min(self._models.values(), key=lambda m: m.last_used)
+                del self._models[target.name]
+            else:
+                # Find by name or alias
+                found_key = None
+                if name in self._models:
+                    found_key = name
+                else:
+                    for k, m in self._models.items():
+                        saved = settings.get_model(m.name)
+                        if saved.get("alias") == name:
+                            found_key = k
+                            break
+                if found_key is None:
+                    return False
+                del self._models[found_key]
+        _clear_mlx_cache()
         return True
 
 
@@ -464,7 +577,7 @@ def _file_count(path: Path) -> int:
     return sum(1 for p in path.rglob("*") if p.is_file() and not p.is_symlink())
 
 
-engine = Engine()
+engine = EnginePool()
 hf = HFManager()
 settings = Settings(SETTINGS_PATH)
 app = FastAPI(title="MLXr", version="0.1.0")
@@ -488,7 +601,7 @@ _API_KEY: Optional[str] = os.environ.get("MLXR_API_KEY") or None
 
 
 async def _idle_unload_task() -> None:
-    """Background task: auto-unload a model that has been idle past its TTL.
+    """Background task: auto-unload models that have been idle past their TTL.
 
     Checks every 60 seconds. The TTL (``idle_timeout_minutes``) is a per-model
     setting stored in ~/.mlxr/settings.json. A value of None means 'never
@@ -497,20 +610,15 @@ async def _idle_unload_task() -> None:
     """
     while True:
         await asyncio.sleep(60)
-        cur = engine.current
-        if cur is None:
-            continue
-        saved = settings.get_model(cur.name)
-        timeout_min = saved.get("idle_timeout_minutes")
-        if timeout_min is None:
-            continue
-        idle_sec = time.time() - cur.last_used
-        if idle_sec >= timeout_min * 60:
-            log.info(
-                "Auto-unloading %s: idle %.1f min ≥ TTL %d min",
-                cur.name, idle_sec / 60, timeout_min,
-            )
-            engine.unload()
+        for m in engine.loaded_models():
+            saved = settings.get_model(m.name)
+            timeout_min = saved.get("idle_timeout_minutes")
+            if timeout_min and (time.time() - m.last_used) >= timeout_min * 60:
+                log.info(
+                    "Auto-unloading %s: idle %.1f min >= TTL %d min",
+                    m.name, (time.time() - m.last_used) / 60, timeout_min,
+                )
+                engine.unload(m.name)
 
 
 @app.on_event("startup")
@@ -600,7 +708,32 @@ def _host_stats() -> dict:
     return stats
 
 
+def _resolve_model(name: Optional[str]) -> Optional[LoadedModel]:
+    """Return a loaded model by name/alias, or the most-recently-used model."""
+    if name:
+        return engine.get(name)
+    return engine.current
+
+
+def _pool_model_state(m: LoadedModel) -> dict:
+    """Return state dict for a single pool entry (used by /api/models/pool)."""
+    return {
+        "loaded": True,
+        "name": m.name,
+        "loaded_at": m.loaded_at,
+        "uptime_seconds": time.time() - m.loaded_at,
+        "generations": m.generations,
+        "total_tokens": m.total_tokens,
+        "last_used": m.last_used,
+        "context_length": m.context_length,
+        "last_ttft": m.last_ttft,
+        "last_tps": m.last_tps,
+        "is_vlm": m.is_vlm,
+    }
+
+
 def _model_state() -> dict:
+    """Return state of the most-recently-used model for backward compat."""
     cur = engine.current
     if not cur:
         return {"loaded": False, "loading": engine.loading}
@@ -616,6 +749,7 @@ def _model_state() -> dict:
         "context_length": cur.context_length,
         "last_ttft": cur.last_ttft,
         "last_tps": cur.last_tps,
+        "is_vlm": cur.is_vlm,
     }
 
 
@@ -1183,14 +1317,19 @@ class ToolCallParser:
         }
 
 
-def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest):
+def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: list = ()):
     """Build a stream_generate iterator using the best available sampler.
 
     Tries to pass advanced sampling params (min_p, repetition_penalty) to
     make_sampler and falls back gracefully when an older mlx-lm doesn't
     accept them.  Always falls back to the bare temp= kwarg path when
     make_sampler itself is unavailable.
+
+    When cur.is_vlm and images are provided, delegates to _make_vlm_iterator.
     """
+    if cur.is_vlm and images:
+        return _make_vlm_iterator(cur, prompt, req, list(images))
+
     from mlx_lm import stream_generate
 
     gen_kwargs: dict[str, Any] = {
@@ -1216,6 +1355,71 @@ def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest):
         return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, sampler=sampler)
     except ImportError:
         return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, temp=req.temperature)
+
+
+def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: list):
+    """Build a VLM stream iterator using mlx_vlm.stream_generate."""
+    try:
+        from mlx_vlm import stream_generate as vlm_stream
+        from mlx_vlm.utils import load_image
+    except ImportError:
+        log.warning("mlx-vlm not installed — falling back to text-only generation")
+        return _make_iterator(cur, prompt, req)
+
+    img_objs = []
+    for url in images:
+        try:
+            img_objs.append(load_image(url))
+        except Exception as e:
+            log.warning("Failed to load image %s: %s", url, e)
+
+    if not img_objs:
+        return _make_iterator(cur, prompt, req)
+
+    return vlm_stream(
+        cur.model, cur.tokenizer, prompt,
+        image=img_objs[0] if len(img_objs) == 1 else img_objs,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+    )
+
+
+def _render_vlm_prompt(cur: LoadedModel, messages: list[dict], images: list) -> str:
+    """Build a VLM-formatted prompt string."""
+    try:
+        from mlx_vlm.prompt_utils import apply_chat_template as vlm_tmpl
+        # Extract last user text for the VLM prompt
+        user_text = next(
+            (m["content"] for m in reversed(messages) if m["role"] == "user"),
+            ""
+        )
+        return vlm_tmpl(cur.tokenizer, cur.model.config, user_text, num_images=len(images))
+    except Exception as e:
+        log.warning("VLM apply_chat_template failed (%s), falling back to regular template", e)
+        return _render_chat(cur.tokenizer, messages)
+
+
+def _extract_images(messages: list[dict]) -> tuple[list[dict], list[str]]:
+    """Strip image_url content parts out of messages, return (clean_msgs, urls)."""
+    clean, urls = [], []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            parts, img_urls = [], []
+            for p in content:
+                if isinstance(p, dict):
+                    if p.get("type") == "text":
+                        parts.append(p.get("text", ""))
+                    elif p.get("type") == "image_url":
+                        u = p.get("image_url") or {}
+                        url = u.get("url", "") if isinstance(u, dict) else str(u)
+                        if url:
+                            img_urls.append(url)
+            urls.extend(img_urls)
+            clean.append({**m, "content": "".join(parts)})
+        else:
+            clean.append(m)
+    return clean, urls
 
 
 def _strip_thinking_enabled(cur: LoadedModel) -> bool:
@@ -1451,9 +1655,21 @@ async def api_load(req: LoadRequest) -> dict:
     return {"ok": True, "name": loaded.name, "loaded_at": loaded.loaded_at}
 
 
+class UnloadRequest(BaseModel):
+    name: Optional[str] = None
+    model_config = {"extra": "ignore"}
+
+
 @app.post("/api/models/unload")
-def api_unload() -> dict:
-    return {"ok": engine.unload()}
+def api_unload(req: Optional[UnloadRequest] = None) -> dict:
+    name = req.name if req else None
+    return {"ok": engine.unload(name)}
+
+
+@app.get("/api/models/pool")
+def api_models_pool() -> dict:
+    """Return all loaded models in the pool, newest-used first."""
+    return {"models": [_pool_model_state(m) for m in engine.loaded_models()]}
 
 
 @app.post("/api/generate")
@@ -1482,6 +1698,7 @@ async def api_generate(req: GenerateRequest):
 def _generate_blocking(
     cur: LoadedModel, rendered: str, req: GenerateRequest,
     starts_in_think: bool = False,
+    images: list = (),
 ) -> tuple[str, int, str]:
     """Run blocking generation. Returns (text, token_count, finish_reason).
 
@@ -1489,7 +1706,7 @@ def _generate_blocking(
     per-generation performance without needing a separate stats endpoint.
     """
     # Build iterator before acquiring the lock — stream_generate is lazy.
-    iterator = _make_iterator(cur, rendered, req)
+    iterator = _make_iterator(cur, rendered, req, images)
 
     parts: list[str] = []
     token_count = 0
@@ -1678,27 +1895,26 @@ class OAIChatRequest(BaseModel):
 
 @app.get("/v1/models")
 def v1_models() -> dict:
-    cur = engine.current
     data = []
-    if cur:
-        saved = settings.get_model(cur.name)
+    for m in engine.loaded_models():
+        saved = settings.get_model(m.name)
         alias = saved.get("alias")
         # Always list the canonical HuggingFace repo-id.
         data.append({
-            "id": cur.name,
+            "id": m.name,
             "object": "model",
-            "created": int(cur.loaded_at),
+            "created": int(m.loaded_at),
             "owned_by": "mlxr",
-            "context_length": cur.context_length,  # non-standard but useful
+            "context_length": m.context_length,  # non-standard but useful
         })
         # Also expose the alias so clients that have it hardcoded can find the model.
-        if alias and alias != cur.name:
+        if alias and alias != m.name:
             data.append({
                 "id": alias,
                 "object": "model",
-                "created": int(cur.loaded_at),
+                "created": int(m.loaded_at),
                 "owned_by": "mlxr",
-                "context_length": cur.context_length,
+                "context_length": m.context_length,
             })
     return {"object": "list", "data": data}
 
@@ -1735,7 +1951,7 @@ async def v1_completions(req: OAICompletionRequest):
     is what the OpenAI spec describes.  Useful for Aider's –-model=openai/…
     mode and other tools that use the older completions API.
     """
-    cur = engine.current
+    cur = _resolve_model(req.model)
     if not cur:
         return _oai_error(503, "no_model_loaded", "No model is loaded in MLXr. Load one from the dashboard first.")
 
@@ -1911,7 +2127,7 @@ async def _oai_stream_completions(
 
 @app.post("/v1/chat/completions")
 async def v1_chat_completions(req: OAIChatRequest):
-    cur = engine.current
+    cur = _resolve_model(req.model)
     if not cur:
         # Use OpenAI's error envelope so SDK clients surface the message cleanly.
         return _oai_error(503, "no_model_loaded", "No model is loaded in MLXr. Load one from the dashboard first.")
@@ -1958,6 +2174,9 @@ async def v1_chat_completions(req: OAIChatRequest):
             # When an assistant message carries tool_calls, content is usually
             # empty; keep it as an empty string so templates don't crash.
         messages.append(entry)
+
+    # Extract image URLs from multimodal content parts.
+    messages, image_urls = _extract_images(messages)
 
     # Inject saved system prompt if the client didn't send one.
     if not any(m["role"] == "system" for m in messages) and saved.get("system"):
@@ -2030,9 +2249,12 @@ async def v1_chat_completions(req: OAIChatRequest):
     else:
         enable_thinking = bool(saved_enable_thinking)
 
-    prompt = _render_chat(
-        cur.tokenizer, messages, tools=tools_for_template, enable_thinking=enable_thinking,
-    )
+    if cur.is_vlm and image_urls:
+        prompt = _render_vlm_prompt(cur, messages, image_urls)
+    else:
+        prompt = _render_chat(
+            cur.tokenizer, messages, tools=tools_for_template, enable_thinking=enable_thinking,
+        )
     starts_in_think = _prompt_starts_in_think(prompt)
     # Resolve model_id: prefer the alias (if set) so responses echo back the
     # same name the client used, preserving round-trip compatibility.
@@ -2106,13 +2328,14 @@ async def v1_chat_completions(req: OAIChatRequest):
                 cur, prompt, gen_req, model_id,
                 tools_active=tools_active, starts_in_think=starts_in_think,
                 entry_id=entry_id, include_usage=req.include_usage(),
+                images=image_urls,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     text, tokens, gen_finish_reason = await asyncio.to_thread(
-        _generate_blocking, cur, prompt, gen_req, starts_in_think,
+        _generate_blocking, cur, prompt, gen_req, starts_in_think, image_urls,
     )
     # Record what the model actually produced for diagnostics.
     _update_chat(entry_id, {
@@ -2304,6 +2527,7 @@ async def _oai_stream_chat(
     cur: LoadedModel, prompt: str, req: GenerateRequest, model_id: str,
     tools_active: bool = False, starts_in_think: bool = False,
     entry_id: Optional[str] = None, include_usage: bool = False,
+    images: list = (),
 ) -> AsyncIterator[bytes]:
     """Stream chat.completion.chunk events in OpenAI's SSE format."""
     from mlx_lm import stream_generate
@@ -2351,7 +2575,7 @@ async def _oai_stream_chat(
                 queue.put({"__gen_start__": t_gen_start}), loop
             )
             try:
-                iterator = _make_iterator(cur, prompt, req)
+                iterator = _make_iterator(cur, prompt, req, images)
                 gen_finish_reason = "stop"
                 for c in iterator:
                     piece = getattr(c, "text", c) if not isinstance(c, str) else c
@@ -2848,7 +3072,7 @@ async def v1_messages(req: AnthropicRequest):
     Enables Claude Code, some agent frameworks, and Cursor's native Anthropic
     mode to use locally-hosted MLX models without an adapter.
     """
-    cur = engine.current
+    cur = _resolve_model(req.model)
     if not cur:
         from fastapi.responses import JSONResponse
         return JSONResponse(
@@ -3259,7 +3483,7 @@ async def v1_embeddings(req: EmbeddingRequest):
     loaded through mlx-lm.  Falls back to mean-pooling the token embedding
     table for generative LLMs, which provides useful-but-not-fine-tuned vectors.
     """
-    cur = engine.current
+    cur = _resolve_model(req.model)
     if not cur:
         return _oai_error(503, "no_model_loaded", "No model loaded. Load one from the dashboard.")
 
@@ -3298,6 +3522,80 @@ async def v1_embeddings(req: EmbeddingRequest):
         "data": data,
         "model": model_id,
         "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+    }
+
+
+# ---- Rerank API (/v1/rerank) -----------------------------------------------
+# Cohere/Jina-compatible reranking endpoint using embedding cosine similarity.
+
+
+class RerankRequest(BaseModel):
+    model: Optional[str] = None
+    query: str
+    documents: list[Any]  # list[str] or list[{"text": str}]
+    top_n: Optional[int] = None
+    return_documents: bool = True
+    model_config = {"extra": "ignore"}
+
+
+@app.post("/v1/rerank")
+async def v1_rerank(req: RerankRequest):
+    """Cohere/Jina-compatible reranking via embedding cosine similarity.
+
+    Works with any loaded model. Uses the same _embed_texts backend as
+    /v1/embeddings.
+    """
+    cur = _resolve_model(req.model)
+    if not cur:
+        return _oai_error(503, "no_model_loaded", "No model loaded.")
+
+    # Normalise documents to strings.
+    docs = []
+    for d in req.documents:
+        if isinstance(d, str):
+            docs.append(d)
+        elif isinstance(d, dict):
+            docs.append(d.get("text", str(d)))
+        else:
+            docs.append(str(d))
+
+    # Embed query + all docs together.
+    try:
+        all_texts = [req.query] + docs
+        vecs = await asyncio.to_thread(_embed_texts, cur, all_texts, "float")
+    except ValueError as e:
+        return _oai_error(422, "embedding_unsupported", str(e))
+    except Exception as e:
+        log.exception("rerank embed failed")
+        return _oai_error(500, "rerank_error", str(e))
+
+    import math
+
+    def cosine(a, b):
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        return dot / (na * nb + 1e-9)
+
+    q_vec = vecs[0]
+    scored = [(i, cosine(q_vec, vecs[i + 1])) for i in range(len(docs))]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    top_n = req.top_n or len(docs)
+    results = []
+    for rank, (idx, score) in enumerate(scored[:top_n]):
+        r: dict[str, Any] = {"index": idx, "relevance_score": score}
+        if req.return_documents:
+            r["document"] = {"text": docs[idx]}
+        results.append(r)
+
+    saved = settings.get_model(cur.name)
+    model_id = req.model or saved.get("alias") or cur.name
+    return {
+        "id": f"rerank-{uuid.uuid4().hex[:16]}",
+        "model": model_id,
+        "results": results,
+        "usage": {"prompt_tokens": 0, "total_tokens": 0},
     }
 
 

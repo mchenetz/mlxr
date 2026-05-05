@@ -90,6 +90,7 @@ last throughput:${tpsStr}`
 
   renderEndpoint(m.loaded ? m.name : null, m.context_length);
   onModelStateChanged(m);
+  refreshPool();
 
   const dl = $("modelList");
   if (s.suggested && dl.children.length === 0) {
@@ -120,7 +121,7 @@ $("loadBtn").addEventListener("click", async () => {
 
 $("unloadBtn").addEventListener("click", async () => {
   try {
-    await api("/api/models/unload", { method: "POST" });
+    await api("/api/models/unload", { method: "POST", body: JSON.stringify({}) });
     toast("Unloaded", "ok");
   } catch (e) {
     toast(`Unload failed: ${e.message}`, "err");
@@ -1037,6 +1038,56 @@ function renderBenchSummary(runs, summary) {
   table.innerHTML = html;
 }
 
+
+// ---- Model Pool panel --------------------------------------------------
+
+async function refreshPool() {
+  try {
+    const r = await api("/api/models/pool");
+    renderPool(r.models || []);
+  } catch (e) {
+    // server may not support endpoint yet — ignore silently
+  }
+}
+
+function renderPool(models) {
+  const statusEl = $("poolStatus");
+  const sizeEl = $("poolSize");
+
+  const maxModels = 1; // default; server-side env controls actual max
+  if (sizeEl) {
+    sizeEl.textContent = `${models.length} loaded`;
+  }
+
+  if (!statusEl) return;
+  if (!models.length) {
+    statusEl.textContent = "";
+    return;
+  }
+
+  // Build a compact pool summary line
+  const parts = models.map((m, i) => {
+    const ttft = m.last_ttft != null ? `${(m.last_ttft * 1000).toFixed(0)} ms` : "—";
+    const tps  = m.last_tps  != null ? `${m.last_tps.toFixed(1)} tok/s` : "—";
+    const vlm  = m.is_vlm ? " [VLM]" : "";
+    const shortName = (m.name || "").split("/").pop();
+    return `${escapeHtml(shortName)}${vlm} · TTFT ${ttft} · ${tps}`;
+  });
+  statusEl.innerHTML = parts.map((p, i) => {
+    const m = models[i];
+    return `<span style="margin-right:12px">${p} <button style="font-size:10px;padding:1px 5px" onclick="unloadPoolModel(${JSON.stringify(m.name)})">Unload</button></span>`;
+  }).join("");
+}
+
+async function unloadPoolModel(name) {
+  try {
+    await api("/api/models/unload", { method: "POST", body: JSON.stringify({ name }) });
+    toast(`Unloaded ${name}`, "ok");
+    refreshStatus();
+  } catch (e) {
+    toast(`Unload failed: ${e.message}`, "err");
+  }
+}
 
 $("output").classList.add("empty");
 // Populate endpoint info up-front so Base URL / examples are always visible,
