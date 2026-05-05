@@ -76,6 +76,8 @@ function renderStatus(s) {
     vPill.classList.toggle("error", !!versions.python_too_old);
   }
   renderPythonWarning(versions);
+  const hfWarn = $("hfTokenWarn");
+  if (hfWarn) hfWarn.classList.toggle("hidden", s.hf_token_set !== false);
 
   const ttftStr = m.last_ttft != null ? `${(m.last_ttft * 1000).toFixed(0)} ms` : "—";
   const tpsStr  = m.last_tps  != null ? `${m.last_tps.toFixed(1)} tok/s` : "—";

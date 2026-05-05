@@ -70,6 +70,29 @@ SUGGESTED_MODELS = [
 
 MLXR_MAX_MODELS = max(1, int(os.environ.get("MLXR_MAX_MODELS", "1")))
 
+# HuggingFace auth token — read once at startup.
+# Set HF_TOKEN (or the legacy HUGGINGFACE_HUB_TOKEN) in the environment to
+# authenticate downloads.  Without it, requests are rate-limited and large
+# model downloads become impractically slow.
+_HF_TOKEN: Optional[str] = (
+    os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
+)
+if _HF_TOKEN:
+    # Configure huggingface_hub globally so every call (model_info, snapshot_download,
+    # try_to_load_from_cache, etc.) uses the token without each call site having to
+    # pass it explicitly.
+    try:
+        from huggingface_hub import login as _hf_login
+        _hf_login(token=_HF_TOKEN, add_to_git_credential=False)
+        log.info("HuggingFace: authenticated via HF_TOKEN")
+    except Exception as _e:
+        log.warning("HuggingFace: token login failed (%s) — continuing unauthenticated", _e)
+else:
+    log.warning(
+        "HuggingFace: no HF_TOKEN set — downloads will be rate-limited. "
+        "Set HF_TOKEN in your environment for faster, authenticated access."
+    )
+
 
 @dataclass
 class LoadedModel:
@@ -127,6 +150,43 @@ def _clear_mlx_cache() -> None:
         mx.metal.clear_cache()
     except Exception:
         pass
+
+
+# ---- HuggingFace cache helpers -------------------------------------------
+
+def _is_model_cached(name: str) -> bool:
+    """Return True if the model is fully available locally.
+
+    Accepts either a HuggingFace repo ID (org/model) or an absolute/relative
+    local path.  For HF repos, checks whether a complete snapshot exists in the
+    local hub cache; for local paths, checks that the directory exists.
+
+    This is used before loading to prevent mlx-lm from silently downloading
+    large model weights inside the Load call (which has no progress feedback).
+    """
+    # Local path — just check the directory.
+    p = Path(name)
+    if p.is_absolute() or name.startswith("./") or name.startswith("../"):
+        return p.is_dir()
+
+    # HuggingFace repo ID — look for a refs/main (or any revision) snapshot.
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        cache_root = Path(HF_HUB_CACHE) / f"models--{name.replace('/', '--')}"
+        if not cache_root.exists():
+            return False
+        # A complete snapshot has at least one entry under snapshots/ that
+        # contains a non-empty directory (the actual files are in blobs/).
+        snapshots_dir = cache_root / "snapshots"
+        if not snapshots_dir.is_dir():
+            return False
+        for snapshot in snapshots_dir.iterdir():
+            if snapshot.is_dir() and any(snapshot.iterdir()):
+                return True
+        return False
+    except Exception:
+        # If we can't check, allow the load to proceed.
+        return True
 
 
 # ---- VLM helpers ---------------------------------------------------------
@@ -257,6 +317,16 @@ class EnginePool:
                     lru_name = min(self._models, key=lambda k: self._models[k].last_used)
                     log.info("Pool full — evicting LRU model %s", lru_name)
                     del self._models[lru_name]
+
+            # Refuse to load a model that isn't in the local HF cache.
+            # mlx-lm would silently download it (potentially many GB) with no
+            # progress feedback. Direct the user to the Import panel instead.
+            if not _is_model_cached(name):
+                raise RuntimeError(
+                    f"'{name}' is not in the local HuggingFace cache. "
+                    "Use the 'Import from Hugging Face' panel to download it first, "
+                    "then Load."
+                )
 
             log.info("Loading model %s", name)
             t0 = time.time()
@@ -460,7 +530,7 @@ class HFManager:
 
             # Determine total size up front so the UI can show a progress bar.
             try:
-                info = HfApi().model_info(job.repo_id, files_metadata=True)
+                info = HfApi(token=_HF_TOKEN).model_info(job.repo_id, files_metadata=True)
                 siblings = getattr(info, "siblings", []) or []
                 job.files_total = len(siblings)
                 job.total_bytes = sum(int(getattr(s, "size", 0) or 0) for s in siblings)
@@ -473,6 +543,7 @@ class HFManager:
             try:
                 local_dir = snapshot_download(
                     repo_id=job.repo_id,
+                    token=_HF_TOKEN,
                     # Avoid blowing up memory for tokenizer-less repos; MLX models are small-ish.
                     allow_patterns=None,
                 )
@@ -1921,6 +1992,7 @@ def api_status() -> dict:
         "model": _model_state(),
         "suggested": SUGGESTED_MODELS,
         "versions": _engine_versions(),
+        "hf_token_set": bool(_HF_TOKEN),
     }
 
 
