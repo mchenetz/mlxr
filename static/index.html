@@ -75,6 +75,29 @@
       </section>
 
       <section class="card span-2">
+        <h2>KV Cache <span id="kvcStatusBadge" class="badge">—</span></h2>
+        <p class="muted" style="margin:0 0 10px">
+          Prefix KV-cache reuses computed attention states across requests.
+          Hot entries live in RAM; overflows persist to SSD and are restored on match.
+          Set <code>MLXR_MAX_MODELS&gt;1</code> to share cache across model switches.
+        </p>
+        <div class="stats" id="kvcStats">
+          <div><label>RAM entries</label><span id="kvcRam">—</span></div>
+          <div><label>RAM max</label><span id="kvcRamMax">—</span></div>
+          <div><label>Disk entries</label><span id="kvcDisk">—</span></div>
+          <div><label>Disk max</label><span id="kvcDiskMax">—</span></div>
+          <div><label>Disk used</label><span id="kvcDiskBytes">—</span></div>
+          <div><label>Cache dir</label><span id="kvcDir" class="mono" style="font-size:11px">—</span></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="kvcRefreshBtn">Refresh</button>
+          <button id="kvcClearAllBtn">Clear all</button>
+          <button id="kvcClearModelBtn">Clear current model</button>
+          <span id="kvcHint" class="muted"></span>
+        </div>
+      </section>
+
+      <section class="card span-2">
         <h2>Engine</h2>
         <div id="pythonWarn" class="warn-banner hidden"></div>
         <table id="engineVersions" class="vtable"></table>

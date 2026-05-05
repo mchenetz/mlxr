@@ -91,6 +91,7 @@ last throughput:${tpsStr}`
   renderEndpoint(m.loaded ? m.name : null, m.context_length);
   onModelStateChanged(m);
   refreshPool();
+  refreshKvcStats();
 
   const dl = $("modelList");
   if (s.suggested && dl.children.length === 0) {
@@ -1089,6 +1090,57 @@ async function unloadPoolModel(name) {
   }
 }
 
+// ---- KV Cache panel ---------------------------------------------------
+
+async function refreshKvcStats() {
+  try {
+    const r = await api("/api/kvcache/stats");
+    const badge = $("kvcStatusBadge");
+    if (r.enabled) {
+      badge.textContent = "enabled";
+      badge.className = "badge ok";
+    } else {
+      badge.textContent = "disabled";
+      badge.className = "badge warn";
+    }
+    $("kvcRam").textContent       = r.ram_entries ?? "—";
+    $("kvcRamMax").textContent    = r.ram_max ?? "—";
+    $("kvcDisk").textContent      = r.disk_entries ?? "—";
+    $("kvcDiskMax").textContent   = r.disk_max ?? "—";
+    $("kvcDiskBytes").textContent = fmtBytes(r.disk_bytes ?? 0);
+    $("kvcDir").textContent       = r.cache_dir || "—";
+  } catch (e) {
+    // server may not have endpoint yet
+  }
+}
+
+$("kvcRefreshBtn").addEventListener("click", refreshKvcStats);
+
+$("kvcClearAllBtn").addEventListener("click", async () => {
+  if (!confirm("Clear ALL KV-cache entries (RAM + disk)?")) return;
+  try {
+    const r = await api("/api/kvcache/clear", { method: "POST", body: JSON.stringify({}) });
+    toast(`Cleared ${r.ram_cleared} RAM + ${r.disk_cleared} disk entries`, "ok");
+    refreshKvcStats();
+  } catch (e) {
+    toast(`Clear failed: ${e.message}`, "err");
+  }
+});
+
+$("kvcClearModelBtn").addEventListener("click", async () => {
+  const m = $("modelInfo").textContent.match(/name:\s*(\S+)/);
+  const name = m ? m[1] : null;
+  if (!name) return toast("No model loaded", "err");
+  if (!confirm(`Clear KV-cache for ${name}?`)) return;
+  try {
+    const r = await api("/api/kvcache/clear", { method: "POST", body: JSON.stringify({ model: name }) });
+    toast(`Cleared ${r.ram_cleared} RAM + ${r.disk_cleared} disk entries`, "ok");
+    refreshKvcStats();
+  } catch (e) {
+    toast(`Clear failed: ${e.message}`, "err");
+  }
+});
+
 $("output").classList.add("empty");
 // Populate endpoint info up-front so Base URL / examples are always visible,
 // even if the backend hasn't responded yet (e.g. in a preview panel).
@@ -1096,6 +1148,7 @@ renderEndpoint(null);
 refreshStatus();
 refreshCache();
 refreshDownloads();
+refreshKvcStats();
 checkUpdates();
 refreshRecentRequests();
 setInterval(refreshStatus, 2500);

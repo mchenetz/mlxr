@@ -6,9 +6,11 @@ running streaming inference, and inspecting host + engine state.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -576,6 +578,236 @@ def _dir_size(path: Path) -> int:
 def _file_count(path: Path) -> int:
     return sum(1 for p in path.rglob("*") if p.is_file() and not p.is_symlink())
 
+
+# ────────────────────────────────────────────────────────────────────
+# Tiered KV-cache  (RAM hot tier  →  SSD cold tier)
+# ────────────────────────────────────────────────────────────────────
+KVC_ENABLED          = os.environ.get("MLXR_KVC_ENABLED", "1") not in ("0", "false", "no")
+KVC_MAX_RAM_ENTRIES  = int(os.environ.get("MLXR_KVC_RAM_ENTRIES", "8"))
+KVC_MAX_DISK_ENTRIES = int(os.environ.get("MLXR_KVC_DISK_ENTRIES", "32"))
+KVC_CACHE_DIR        = Path(os.environ.get("MLXR_KVC_DIR",
+                             str(Path.home() / ".mlxr" / "kvcache")))
+KVC_MIN_PREFIX_LEN   = int(os.environ.get("MLXR_KVC_MIN_PREFIX", "64"))
+
+
+def _kvc_model_key(name: str) -> str:
+    return name.replace("/", "_").replace("\\", "_").replace(":", "_")
+
+
+def _kvc_prefix_hash(token_ids: list, length: int) -> str:
+    buf = b"".join(int(t).to_bytes(4, "little") for t in token_ids[:length])
+    return hashlib.sha256(buf).hexdigest()[:32]
+
+
+def _kvc_serialize(cache: list, path: Path) -> bool:
+    """Save a KV-cache to a compressed NPZ file. Returns True on success."""
+    try:
+        import numpy as np
+        import mlx.core as mx
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arrays: dict = {}
+        n = 0
+        for i, layer in enumerate(cache):
+            k  = getattr(layer, "keys",   None)
+            v  = getattr(layer, "values", None)
+            off = getattr(layer, "offset", None)
+            if k is None or v is None or not off:
+                continue
+            mx.eval(k, v)
+            ks = k[..., :off, :]
+            vs = v[..., :off, :]
+            mx.eval(ks, vs)
+            arrays[f"l{i}k"] = np.array(ks)
+            arrays[f"l{i}v"] = np.array(vs)
+            arrays[f"l{i}o"] = np.array([off], dtype=np.int64)
+            n += 1
+        if not n:
+            return False
+        np.savez_compressed(str(path), **arrays)
+        log.info("kvc: saved %d layers (%.1f MB) → %s",
+                 n, path.stat().st_size / 1e6, path.name)
+        return True
+    except Exception as e:
+        log.warning("kvc: serialize failed: %s", e)
+        return False
+
+
+def _kvc_deserialize(path: Path, model: Any) -> Optional[list]:
+    """Restore a KV-cache from an NPZ file. Returns None on failure."""
+    try:
+        import numpy as np
+        import mlx.core as mx
+        if not path.exists() or not hasattr(model, "make_cache"):
+            return None
+        data = dict(np.load(str(path)))
+        cache = model.make_cache()
+        n = 0
+        for i, layer in enumerate(cache):
+            if f"l{i}k" not in data:
+                continue
+            layer.keys   = mx.array(data[f"l{i}k"])
+            layer.values = mx.array(data[f"l{i}v"])
+            if hasattr(layer, "offset"):
+                layer.offset = int(data[f"l{i}o"][0])
+            n += 1
+        if not n:
+            return None
+        log.info("kvc: restored %d layers from %s", n, path.name)
+        return cache
+    except Exception as e:
+        log.warning("kvc: deserialize failed (%s): %s", path.name, e)
+        return None
+
+
+class KVCacheManager:
+    """Two-tier KV-cache for prompt-prefix reuse.
+
+    **Hot tier (RAM):** in-process dict of { hash → (cache_list, token_len, ts) }.
+    **Cold tier (SSD):** compressed NPZ files under KVC_CACHE_DIR.
+
+    Keys are SHA-256 hashes of token-ID prefixes at power-of-2 lengths.
+    On a new request, the manager scans from longest to shortest candidate
+    prefix and returns the first (longest) hit, together with the number of
+    tokens that are already computed so the caller can skip them.
+    """
+
+    def __init__(self) -> None:
+        self._lock  = Lock()
+        self._ram:  dict[str, dict[str, tuple]] = {}   # mkey→{h→(cache,len,ts)}
+        self._disk: dict[str, dict[str, dict]]  = {}   # mkey→{h→{"path","tok_len","ts"}}
+        self._load_disk_index()
+
+    # ── public ──────────────────────────────────────────────────────
+
+    def find(self, model_name: str, model: Any, token_ids: list) -> Optional[tuple]:
+        """Return (cache_list, prefix_token_len) or None."""
+        if not KVC_ENABLED or len(token_ids) < KVC_MIN_PREFIX_LEN:
+            return None
+        mkey = _kvc_model_key(model_name)
+        with self._lock:
+            ram  = dict(self._ram.get(mkey,  {}))
+            disk = dict(self._disk.get(mkey, {}))
+
+        for exp in range(14, 5, -1):           # 16384 → 64
+            clen = 1 << exp
+            if clen > len(token_ids) - 1 or clen < KVC_MIN_PREFIX_LEN:
+                continue
+            h = _kvc_prefix_hash(token_ids, clen)
+            if h in ram:
+                cache, tl, _ = ram[h]
+                with self._lock:
+                    t = self._ram.get(mkey, {})
+                    if h in t:
+                        t[h] = (cache, tl, time.time())
+                log.info("kvc: RAM hit — %d tokens for %s", tl, model_name)
+                return cache, tl
+            if h in disk:
+                cache = _kvc_deserialize(disk[h]["path"], model)
+                if cache is not None:
+                    tl = disk[h]["tok_len"]
+                    self._put_ram(mkey, h, cache, tl)
+                    log.info("kvc: disk→RAM hit — %d tokens for %s", tl, model_name)
+                    return cache, tl
+        return None
+
+    def store(self, model_name: str, token_ids: list, cache: list) -> None:
+        """Store cache checkpoints at every power-of-2 prefix length."""
+        if not KVC_ENABLED or len(token_ids) < KVC_MIN_PREFIX_LEN:
+            return
+        mkey = _kvc_model_key(model_name)
+        for exp in range(6, 15):              # 64 → 16384
+            clen = 1 << exp
+            if clen >= len(token_ids):
+                break
+            h = _kvc_prefix_hash(token_ids, clen)
+            self._put_ram(mkey, h, cache, clen)
+        # Full-length entry
+        h = _kvc_prefix_hash(token_ids, len(token_ids))
+        self._put_ram(mkey, h, cache, len(token_ids))
+
+    def clear(self, model_name: Optional[str] = None) -> dict:
+        with self._lock:
+            if model_name:
+                mk = _kvc_model_key(model_name)
+                rn = len(self._ram.pop(mk, {}))
+                dn = len(self._disk.pop(mk, {}))
+                shutil.rmtree(KVC_CACHE_DIR / mk, ignore_errors=True)
+            else:
+                rn = sum(len(v) for v in self._ram.values())
+                dn = sum(len(v) for v in self._disk.values())
+                self._ram.clear(); self._disk.clear()
+                shutil.rmtree(KVC_CACHE_DIR, ignore_errors=True)
+        return {"ram_cleared": rn, "disk_cleared": dn}
+
+    def stats(self) -> dict:
+        with self._lock:
+            rn = sum(len(v) for v in self._ram.values())
+            dn = sum(len(v) for v in self._disk.values())
+        db = sum(f.stat().st_size for f in KVC_CACHE_DIR.rglob("*.npz")
+                 if f.exists()) if KVC_CACHE_DIR.exists() else 0
+        return {
+            "enabled": KVC_ENABLED, "ram_entries": rn, "ram_max": KVC_MAX_RAM_ENTRIES,
+            "disk_entries": dn, "disk_max": KVC_MAX_DISK_ENTRIES,
+            "disk_bytes": db, "cache_dir": str(KVC_CACHE_DIR),
+        }
+
+    # ── internal ────────────────────────────────────────────────────
+
+    def _put_ram(self, mkey: str, h: str, cache: list, tl: int) -> None:
+        with self._lock:
+            tier = self._ram.setdefault(mkey, {})
+            tier[h] = (cache, tl, time.time())
+            while len(tier) > KVC_MAX_RAM_ENTRIES:
+                old_h = min(tier, key=lambda x: tier[x][2])
+                old_c, old_l, _ = tier.pop(old_h)
+                threading.Thread(
+                    target=self._spill, args=(mkey, old_h, old_c, old_l), daemon=True
+                ).start()
+
+    def _spill(self, mkey: str, h: str, cache: list, tl: int) -> None:
+        with self._lock:
+            disk = self._disk.get(mkey, {})
+            if len(disk) >= KVC_MAX_DISK_ENTRIES:
+                old_h = min(disk, key=lambda x: disk[x]["ts"])
+                try:
+                    disk.pop(old_h)["path"].unlink(missing_ok=True)
+                except Exception:
+                    pass
+        path = KVC_CACHE_DIR / mkey / f"{h}.npz"
+        if _kvc_serialize(cache, path):
+            with self._lock:
+                self._disk.setdefault(mkey, {})[h] = {"path": path, "tok_len": tl, "ts": time.time()}
+            self._save_meta(mkey)
+
+    def _load_disk_index(self) -> None:
+        if not KVC_CACHE_DIR.exists():
+            return
+        for d in KVC_CACHE_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            mkey = d.name
+            meta_p = d / "_meta.json"
+            if meta_p.exists():
+                try:
+                    for h, info in json.loads(meta_p.read_text()).items():
+                        p = d / f"{h}.npz"
+                        if p.exists():
+                            self._disk.setdefault(mkey, {})[h] = {
+                                "path": p, "tok_len": info.get("tok_len", 0), "ts": info.get("ts", 0.0)
+                            }
+                except Exception as e:
+                    log.debug("kvc: meta error %s: %s", d.name, e)
+
+    def _save_meta(self, mkey: str) -> None:
+        d = KVC_CACHE_DIR / mkey
+        d.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            meta = {h: {"tok_len": v["tok_len"], "ts": v["ts"]}
+                    for h, v in self._disk.get(mkey, {}).items()}
+        (d / "_meta.json").write_text(json.dumps(meta, indent=2))
+
+
+kvc = KVCacheManager()
 
 engine = EnginePool()
 hf = HFManager()
@@ -1317,7 +1549,8 @@ class ToolCallParser:
         }
 
 
-def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: list = ()):
+def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest,
+                   images=(), prompt_cache: Optional[list] = None):
     """Build a stream_generate iterator using the best available sampler.
 
     Tries to pass advanced sampling params (min_p, repetition_penalty) to
@@ -1336,6 +1569,8 @@ def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: 
         "prompt": prompt,
         "max_tokens": req.max_tokens,
     }
+    if prompt_cache is not None:
+        gen_kwargs["prompt_cache"] = prompt_cache
     try:
         from mlx_lm.sample_utils import make_sampler
 
@@ -1352,9 +1587,20 @@ def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: 
         except TypeError:
             # Older mlx-lm: drop advanced params and retry.
             sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
-        return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, sampler=sampler)
+        try:
+            return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, sampler=sampler)
+        except TypeError:
+            gen_kwargs.pop("prompt_cache", None)
+            try:
+                return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, sampler=sampler)
+            except TypeError:
+                return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, temp=req.temperature)
     except ImportError:
-        return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, temp=req.temperature)
+        try:
+            return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, temp=req.temperature)
+        except TypeError:
+            gen_kwargs.pop("prompt_cache", None)
+            return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, temp=req.temperature)
 
 
 def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, images: list):
@@ -1705,8 +1951,26 @@ def _generate_blocking(
     Also updates cur.last_ttft and cur.last_tps so the dashboard can show
     per-generation performance without needing a separate stats endpoint.
     """
+    # ── KV-cache lookup ──────────────────────────────────────────────
+    prompt_cache: Optional[list] = None
+    if KVC_ENABLED and not cur.is_vlm:
+        try:
+            _tok = getattr(cur.tokenizer, "tokenizer", cur.tokenizer)
+            _ids = _tok.encode(rendered)
+            _hit = kvc.find(cur.name, cur.model, _ids)
+            if _hit:
+                prompt_cache, _skip = _hit
+                log.info("kvc: blocking — resuming from %d cached tokens", _skip)
+        except Exception as _e:
+            log.debug("kvc: lookup error: %s", _e)
+        if prompt_cache is None and hasattr(cur.model, "make_cache"):
+            try:
+                prompt_cache = cur.model.make_cache()
+            except Exception:
+                pass
+
     # Build iterator before acquiring the lock — stream_generate is lazy.
-    iterator = _make_iterator(cur, rendered, req, images)
+    iterator = _make_iterator(cur, rendered, req, images, prompt_cache=prompt_cache)
 
     parts: list[str] = []
     token_count = 0
@@ -1736,6 +2000,15 @@ def _generate_blocking(
         cur.last_ttft = t_first_token - t_gen_start
     elapsed = t_gen_end - t_gen_start
     cur.last_tps = token_count / elapsed if elapsed > 0 else None
+
+    # ── KV-cache store ────────────────────────────────────────────────
+    if prompt_cache is not None and not cur.is_vlm:
+        try:
+            _tok = getattr(cur.tokenizer, "tokenizer", cur.tokenizer)
+            _ids = _tok.encode(rendered)
+            kvc.store(cur.name, _ids, prompt_cache)
+        except Exception as _e:
+            log.debug("kvc: store error: %s", _e)
 
     text = "".join(parts)
     if text:
@@ -2040,8 +2313,25 @@ async def _oai_stream_completions(
                 log.info("MLX (completions stream) queued for %.1fs", waited)
             t_gen_start = time.time()
             asyncio.run_coroutine_threadsafe(queue.put({"__gen_start__": t_gen_start}), loop)
+            # ── KV-cache lookup (in worker thread, holds gen_lock) ────
+            _prompt_cache: Optional[list] = None
+            if KVC_ENABLED and not cur.is_vlm:
+                try:
+                    _tok = getattr(cur.tokenizer, "tokenizer", cur.tokenizer)
+                    _ids = _tok.encode(prompt)
+                    _hit = kvc.find(cur.name, cur.model, _ids)
+                    if _hit:
+                        _prompt_cache, _skip = _hit
+                        log.info("kvc: completions stream — resuming from %d cached tokens", _skip)
+                except Exception as _e:
+                    log.debug("kvc: completions stream lookup error: %s", _e)
+                if _prompt_cache is None and hasattr(cur.model, "make_cache"):
+                    try:
+                        _prompt_cache = cur.model.make_cache()
+                    except Exception:
+                        pass
             try:
-                iterator = _make_iterator(cur, prompt, req)
+                iterator = _make_iterator(cur, prompt, req, prompt_cache=_prompt_cache)
                 gen_finish_reason = "stop"
                 for c in iterator:
                     piece = getattr(c, "text", c) if not isinstance(c, str) else c
@@ -2051,6 +2341,14 @@ async def _oai_stream_completions(
                     if fr:
                         gen_finish_reason = fr
                 asyncio.run_coroutine_threadsafe(queue.put({"__finish_reason__": gen_finish_reason}), loop)
+                # ── KV-cache store ──────────────────────────────────────
+                if _prompt_cache is not None and not cur.is_vlm:
+                    try:
+                        _tok = getattr(cur.tokenizer, "tokenizer", cur.tokenizer)
+                        _ids = _tok.encode(prompt)
+                        kvc.store(cur.name, _ids, _prompt_cache)
+                    except Exception as _e:
+                        log.debug("kvc: completions stream store error: %s", _e)
             except Exception as e:
                 asyncio.run_coroutine_threadsafe(queue.put({"__error__": str(e)}), loop)
             finally:
@@ -2574,8 +2872,25 @@ async def _oai_stream_chat(
             asyncio.run_coroutine_threadsafe(
                 queue.put({"__gen_start__": t_gen_start}), loop
             )
+            # ── KV-cache lookup (in worker thread, holds gen_lock) ────
+            _prompt_cache: Optional[list] = None
+            if KVC_ENABLED and not cur.is_vlm:
+                try:
+                    _tok = getattr(cur.tokenizer, "tokenizer", cur.tokenizer)
+                    _ids = _tok.encode(prompt)
+                    _hit = kvc.find(cur.name, cur.model, _ids)
+                    if _hit:
+                        _prompt_cache, _skip = _hit
+                        log.info("kvc: stream — resuming from %d cached tokens", _skip)
+                except Exception as _e:
+                    log.debug("kvc: stream lookup error: %s", _e)
+                if _prompt_cache is None and hasattr(cur.model, "make_cache"):
+                    try:
+                        _prompt_cache = cur.model.make_cache()
+                    except Exception:
+                        pass
             try:
-                iterator = _make_iterator(cur, prompt, req, images)
+                iterator = _make_iterator(cur, prompt, req, images, prompt_cache=_prompt_cache)
                 gen_finish_reason = "stop"
                 for c in iterator:
                     piece = getattr(c, "text", c) if not isinstance(c, str) else c
@@ -2589,6 +2904,14 @@ async def _oai_stream_chat(
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"__finish_reason__": gen_finish_reason}), loop
                 )
+                # ── KV-cache store ──────────────────────────────────────
+                if _prompt_cache is not None and not cur.is_vlm:
+                    try:
+                        _tok = getattr(cur.tokenizer, "tokenizer", cur.tokenizer)
+                        _ids = _tok.encode(prompt)
+                        kvc.store(cur.name, _ids, _prompt_cache)
+                    except Exception as _e:
+                        log.debug("kvc: stream store error: %s", _e)
             except Exception as e:
                 asyncio.run_coroutine_threadsafe(queue.put({"__error__": str(e)}), loop)
             finally:
@@ -3730,6 +4053,24 @@ async def _request_logger(request, call_next):
     if not path.startswith("/api") and not path.startswith("/v1"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return response
+
+
+@app.get("/api/kvcache/stats")
+def api_kvcache_stats() -> dict:
+    """Return KV-cache tier statistics for the dashboard."""
+    return kvc.stats()
+
+
+class KVClearRequest(BaseModel):
+    model: Optional[str] = None   # if set, clear only this model's cache
+
+
+@app.post("/api/kvcache/clear")
+async def api_kvcache_clear(req: KVClearRequest) -> dict:
+    """Clear KV-cache entries from RAM and disk."""
+    result = await asyncio.to_thread(kvc.clear, req.model)
+    log.info("kvc: cleared %s — %s", req.model or "all", result)
+    return {"ok": True, **result}
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
