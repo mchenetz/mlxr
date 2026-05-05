@@ -51,6 +51,7 @@
             </label>
             <label class="checkbox-row"><input id="setAutoload" type="checkbox" /> Autoload this model on server start</label>
             <label>idle_timeout_minutes <input id="setIdleTimeout" type="number" min="1" max="10080" step="1" placeholder="never" title="Auto-unload after this many minutes of inactivity. Leave blank to keep loaded indefinitely." /></label>
+            <label>Model alias <input id="setAlias" placeholder="e.g. gpt-4o (optional)" title="Expose this friendly name via /v1/models and accept it in request.model. Lets existing configs that hardcode OpenAI model IDs connect to MLXr without changes." /></label>
             <div class="row" style="margin-top: 6px;">
               <button id="saveSettingsBtn" class="primary">Save</button>
               <button id="resetSettingsBtn">Reset</button>
@@ -191,6 +192,23 @@
           <span id="genStats" class="muted"></span>
         </div>
         <pre id="output" class="output"></pre>
+      </section>
+
+      <section class="card span-2">
+        <h2>Benchmark</h2>
+        <p class="muted" style="margin: 0 0 12px">Measure TTFT and throughput for the loaded model. Runs N back-to-back generations and reports per-run timings and averages.</p>
+        <div class="controls">
+          <label>Runs <input id="benchRuns" type="number" min="1" max="10" value="3" style="width:60px" /></label>
+          <label>max_tokens <input id="benchMaxTokens" type="number" min="10" max="2048" value="150" style="width:80px" /></label>
+          <label class="grow">Prompt <input id="benchPrompt" value="Explain in detail how Apple Silicon M-series chips achieve high efficiency." /></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="benchBtn" class="primary">Run Benchmark</button>
+          <button id="benchStopBtn" disabled>Cancel</button>
+          <span id="benchHint" class="muted"></span>
+        </div>
+        <div id="benchProgress" style="margin-top:10px"></div>
+        <table id="benchTable" class="vtable" style="display:none;margin-top:10px"></table>
       </section>
     </main>
 

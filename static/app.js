@@ -421,6 +421,7 @@ async function loadModelSettings(name) {
     $("setEnableThinking").value =
       s.enable_thinking === true ? "true" :
       s.enable_thinking === false ? "false" : "auto";
+    $("setAlias").value = s.alias || "";
     $("settingsHint").textContent = Object.keys(s).length ? "Loaded." : "No overrides — using defaults.";
   } catch (e) {
     $("settingsHint").textContent = `Load failed: ${e.message}`;
@@ -441,6 +442,7 @@ $("saveSettingsBtn").addEventListener("click", async () => {
     enable_thinking:
       $("setEnableThinking").value === "true" ? true :
       $("setEnableThinking").value === "false" ? false : null,
+    alias: $("setAlias").value.trim() || null,
   };
   try {
     await api(`/api/settings/models/${encodeURI(settingsLoadedFor)}`, {
@@ -595,7 +597,11 @@ resp = client.chat.completions.create(
     model="${name}",
     messages=[{"role": "user", "content": "Hello!"}],
 )
-print(resp.choices[0].message.content)`;
+print(resp.choices[0].message.content)
+
+# Embeddings (requires an embedding model to be loaded):
+# emb = client.embeddings.create(model="${name}", input="Hello world")
+# print(emb.data[0].embedding[:5])`;
 }
 
 // Delegated copy handler for table-row copy buttons (data-copy-target)
@@ -902,6 +908,135 @@ function renderRecentRequests(items) {
     container.appendChild(el);
   }
 }
+
+// ---- Benchmark panel ---------------------------------------------------
+
+let _benchController = null;
+
+$("benchBtn").addEventListener("click", runBenchmark);
+$("benchStopBtn").addEventListener("click", () => {
+  if (_benchController) _benchController.abort();
+});
+
+async function runBenchmark() {
+  const runs      = Number($("benchRuns").value) || 3;
+  const maxTokens = Number($("benchMaxTokens").value) || 150;
+  const prompt    = $("benchPrompt").value.trim();
+  if (!prompt) return toast("Enter a benchmark prompt", "err");
+
+  const hint     = $("benchHint");
+  const progress = $("benchProgress");
+  const table    = $("benchTable");
+
+  hint.textContent = "Starting…";
+  progress.innerHTML = "";
+  table.style.display = "none";
+  table.innerHTML = "";
+  $("benchBtn").disabled = true;
+  $("benchStopBtn").disabled = false;
+
+  const controller = new AbortController();
+  _benchController = controller;
+
+  // Build progress bars up-front.
+  const bars = [];
+  for (let i = 0; i < runs; i++) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:13px";
+    row.innerHTML = `<span style="width:50px;color:var(--muted)">Run ${i + 1}</span>
+      <div style="flex:1;height:6px;background:var(--border);border-radius:3px">
+        <div class="bench-bar-fill" style="height:100%;width:0%;background:var(--accent);border-radius:3px;transition:width 0.3s"></div>
+      </div>
+      <span class="bench-bar-label" style="width:120px;color:var(--muted);font-size:11px">waiting…</span>`;
+    progress.appendChild(row);
+    bars.push({ fill: row.querySelector(".bench-bar-fill"), label: row.querySelector(".bench-bar-label") });
+  }
+
+  const runResults = [];
+  let currentRun = 0;
+
+  try {
+    const res = await fetch("/api/benchmark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, max_tokens: maxTokens, runs, temperature: 0 }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+
+    await consumeSSE(res, (event, obj) => {
+      if (event === "run_start") {
+        currentRun = (obj.run || 1) - 1;
+        hint.textContent = `Run ${obj.run} / ${obj.of}…`;
+        if (bars[currentRun]) {
+          bars[currentRun].fill.style.width = "30%";
+          bars[currentRun].label.textContent = "running…";
+        }
+      } else if (event === "run_done") {
+        const idx = (obj.run || 1) - 1;
+        if (bars[idx]) {
+          bars[idx].fill.style.width = "100%";
+          bars[idx].fill.style.background = "var(--ok, #22c55e)";
+          bars[idx].label.textContent = `${obj.ttft_ms} ms · ${obj.tps} tok/s`;
+        }
+        runResults.push(obj);
+      } else if (event === "run_error") {
+        const idx = (obj.run || 1) - 1;
+        if (bars[idx]) {
+          bars[idx].fill.style.background = "var(--err, #ef4444)";
+          bars[idx].fill.style.width = "100%";
+          bars[idx].label.textContent = "error";
+        }
+      } else if (event === "summary") {
+        hint.textContent = `Done — avg ${obj.avg_tps} tok/s · avg TTFT ${obj.avg_ttft_ms} ms`;
+        renderBenchSummary(runResults, obj);
+      }
+    });
+  } catch (e) {
+    if (e.name !== "AbortError") toast(`Benchmark failed: ${e.message}`, "err");
+    hint.textContent = e.name === "AbortError" ? "Cancelled." : `Error: ${e.message}`;
+    bars.forEach(b => { b.fill.style.background = "var(--muted)"; });
+  } finally {
+    $("benchBtn").disabled = false;
+    $("benchStopBtn").disabled = true;
+    _benchController = null;
+  }
+}
+
+function renderBenchSummary(runs, summary) {
+  const table = $("benchTable");
+  table.style.display = "";
+
+  // Per-run rows
+  let html = `<tr><th>Run</th><th>Tokens</th><th>Wall (s)</th><th>TTFT (ms)</th><th>Throughput (tok/s)</th></tr>`;
+  for (const r of runs) {
+    html += `<tr>
+      <td>${r.run}</td>
+      <td>${r.tokens ?? "—"}</td>
+      <td>${r.wall_s != null ? r.wall_s.toFixed(2) : "—"}</td>
+      <td>${r.ttft_ms != null ? r.ttft_ms.toFixed(1) : "—"}</td>
+      <td>${r.tps != null ? r.tps.toFixed(1) : "—"}</td>
+    </tr>`;
+  }
+  // Summary row
+  if (summary.runs > 0) {
+    html += `<tr style="font-weight:600;border-top:2px solid var(--border)">
+      <td>avg</td>
+      <td>${summary.avg_tokens != null ? summary.avg_tokens.toFixed(0) : "—"}</td>
+      <td>—</td>
+      <td>${summary.avg_ttft_ms != null ? summary.avg_ttft_ms.toFixed(1) : "—"}</td>
+      <td>${summary.avg_tps != null ? summary.avg_tps.toFixed(1) : "—"}</td>
+    </tr>
+    <tr style="font-size:11px;color:var(--muted)">
+      <td colspan="5">Peak ${summary.max_tps ?? "—"} tok/s · min TTFT ${summary.min_ttft_ms ?? "—"} ms</td>
+    </tr>`;
+  }
+  table.innerHTML = html;
+}
+
 
 $("output").classList.add("empty");
 // Populate endpoint info up-front so Base URL / examples are always visible,

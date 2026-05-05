@@ -469,6 +469,23 @@ hf = HFManager()
 settings = Settings(SETTINGS_PATH)
 app = FastAPI(title="MLXr", version="0.1.0")
 
+# CORS — allow any browser/frontend origin so OpenWebUI, LibreChat, custom UIs,
+# and Jupyter notebooks can call the API directly without a reverse-proxy.
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Optional API-key gate on /v1/ routes.
+# Set MLXR_API_KEY in the environment to require clients to send
+#   Authorization: Bearer <key>
+# When the env var is not set, any value (or no header) is accepted, which
+# preserves the existing "no auth required" behaviour.
+_API_KEY: Optional[str] = os.environ.get("MLXR_API_KEY") or None
+
 
 async def _idle_unload_task() -> None:
     """Background task: auto-unload a model that has been idle past its TTL.
@@ -1640,6 +1657,11 @@ class OAIChatRequest(BaseModel):
     #   [{"type": "function", "function": {"name": ..., "description": ..., "parameters": <JSON schema>}}]
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None  # "auto" | "none" | "required" | {type, function}
+    # JSON / structured-output mode.
+    # {"type": "json_object"} — injects a system instruction and strips non-JSON
+    #   prefix/suffix.  Full schema-constrained generation is not yet supported.
+    # {"type": "text"} — default, pass-through.
+    response_format: Optional[dict] = None
 
     model_config = {"extra": "ignore"}  # silently drop unknown fields (n, logprobs, etc.)
 
@@ -1659,13 +1681,25 @@ def v1_models() -> dict:
     cur = engine.current
     data = []
     if cur:
+        saved = settings.get_model(cur.name)
+        alias = saved.get("alias")
+        # Always list the canonical HuggingFace repo-id.
         data.append({
             "id": cur.name,
             "object": "model",
             "created": int(cur.loaded_at),
             "owned_by": "mlxr",
-            "context_length": cur.context_length,  # non-standard but useful for clients
+            "context_length": cur.context_length,  # non-standard but useful
         })
+        # Also expose the alias so clients that have it hardcoded can find the model.
+        if alias and alias != cur.name:
+            data.append({
+                "id": alias,
+                "object": "model",
+                "created": int(cur.loaded_at),
+                "owned_by": "mlxr",
+                "context_length": cur.context_length,
+            })
     return {"object": "list", "data": data}
 
 
@@ -1929,6 +1963,23 @@ async def v1_chat_completions(req: OAIChatRequest):
     if not any(m["role"] == "system" for m in messages) and saved.get("system"):
         messages.insert(0, {"role": "system", "content": saved["system"]})
 
+    # JSON mode — response_format: {"type": "json_object"}.
+    # Injects a short system instruction so that models that don't natively
+    # support the JSON mode flag still produce well-formed JSON output.
+    # We append (not prepend) so the instruction is close to the generation
+    # boundary and not buried under a long user system prompt.
+    if req.response_format and req.response_format.get("type") == "json_object":
+        json_instr = (
+            "You MUST respond with valid JSON only. "
+            "Do not include any explanation, markdown fences, or text outside the JSON object."
+        )
+        sys_msgs = [i for i, m in enumerate(messages) if m["role"] == "system"]
+        if sys_msgs:
+            messages[sys_msgs[-1]]["content"] += "\n\n" + json_instr
+        else:
+            messages.append({"role": "system", "content": json_instr})
+        log.info("chat: JSON mode active — injected response_format instruction")
+
     # If the caller passed tool_choice="none", suppress tools entirely so
     # the template doesn't advertise any.
     tools_for_template = req.tools if (req.tools and req.tool_choice != "none") else None
@@ -1983,7 +2034,10 @@ async def v1_chat_completions(req: OAIChatRequest):
         cur.tokenizer, messages, tools=tools_for_template, enable_thinking=enable_thinking,
     )
     starts_in_think = _prompt_starts_in_think(prompt)
-    model_id = req.model or cur.name
+    # Resolve model_id: prefer the alias (if set) so responses echo back the
+    # same name the client used, preserving round-trip compatibility.
+    alias = saved.get("alias")
+    model_id = req.model or alias or cur.name
     tools_active = bool(tools_for_template)
 
     tool_names = [t.get("function", {}).get("name") for t in (tools_for_template or [])]
@@ -2550,6 +2604,10 @@ class ModelSettingsBody(BaseModel):
     enable_thinking: Optional[bool] = None
     # Auto-unload the model after this many minutes of inactivity. None = never.
     idle_timeout_minutes: Optional[int] = Field(default=None, ge=1, le=10080)
+    # Friendly alias exposed through /v1/models and accepted in request.model.
+    # Example: set alias="gpt-4o" so existing configs that hardcode that name
+    # don't need changing.
+    alias: Optional[str] = None
 
 
 @app.get("/api/settings")
@@ -2632,14 +2690,732 @@ async def api_hf_delete(req: HFDeleteRequest) -> dict:
         raise HTTPException(status_code=500, detail=f"delete failed: {e}")
 
 
+# ---- Anthropic Messages API (/v1/messages) --------------------------------
+# Maps the Anthropic Messages API wire format to MLXr's existing chat pipeline.
+# Clients that speak Anthropic (Claude Code, some agent frameworks, Cursor's
+# native mode) can connect without an adapter layer.
+
+
+class _AnthrTool(BaseModel):
+    name: str
+    description: Optional[str] = None
+    input_schema: Optional[dict] = None  # JSON schema of tool parameters
+
+
+class _AnthrToolChoice(BaseModel):
+    type: str = "auto"  # "auto" | "any" | "tool"
+    name: Optional[str] = None
+
+
+class AnthropicRequest(BaseModel):
+    model: Optional[str] = None
+    messages: list[dict]
+    max_tokens: int = Field(default=4096, ge=1)
+    system: Optional[Any] = None   # str or list of content blocks
+    tools: Optional[list[_AnthrTool]] = None
+    tool_choice: Optional[Any] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None    # accepted, ignored (mlx-lm has top_k but not via make_sampler yet)
+    stream: bool = False
+    metadata: Optional[dict] = None
+    stop_sequences: Optional[list[str]] = None
+    model_config = {"extra": "ignore"}
+
+
+def _anth_content_to_str(content: Any) -> str:
+    """Collapse Anthropic content (str or list of blocks) to a plain string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(block.get("text", ""))
+                elif btype == "tool_result":
+                    # tool_result content may itself be a list or str
+                    inner = block.get("content", "")
+                    parts.append(_anth_content_to_str(inner))
+                # image / document blocks: silently skip
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
+def _anth_messages_to_oai(messages: list[dict], system: Any) -> list[dict]:
+    """Convert Anthropic message list + system to OpenAI-style message list."""
+    result: list[dict] = []
+    # Anthropic puts the system prompt as a top-level field, not in messages.
+    if system:
+        sys_text = _anth_content_to_str(system)
+        if sys_text:
+            result.append({"role": "system", "content": sys_text})
+
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content")
+        if isinstance(content, str):
+            result.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            text_parts: list[str] = []
+            tool_calls: list[dict] = []
+            tool_results: list[dict] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    # Anthropic tool_use → OpenAI tool_calls
+                    tc = {
+                        "id": block.get("id", f"call_{uuid.uuid4().hex[:20]}"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input") or {}),
+                        },
+                    }
+                    tool_calls.append(tc)
+                elif btype == "tool_result":
+                    # Anthropic tool_result → OpenAI tool role message
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", ""),
+                        "content": _anth_content_to_str(block.get("content", "")),
+                    })
+            if tool_results:
+                result.extend(tool_results)
+            elif tool_calls:
+                entry: dict[str, Any] = {
+                    "role": role,
+                    "content": "".join(text_parts) or None,
+                    "tool_calls": tool_calls,
+                }
+                result.append(entry)
+            elif text_parts:
+                result.append({"role": role, "content": "".join(text_parts)})
+    return result
+
+
+def _anth_tools_to_oai(tools: list[_AnthrTool]) -> list[dict]:
+    """Convert Anthropic tool list to OpenAI function-tool format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description or "",
+                "parameters": t.input_schema or {"type": "object", "properties": {}},
+            },
+        }
+        for t in tools
+    ]
+
+
+def _oai_finish_to_anth_stop(finish_reason: str) -> str:
+    return {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(
+        finish_reason, "end_turn"
+    )
+
+
+def _build_anth_response(
+    msg_id: str, model_id: str, content_blocks: list[dict],
+    stop_reason: str, input_tokens: int, output_tokens: int,
+) -> dict:
+    return {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model_id,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
+
+
+@app.post("/v1/messages")
+async def v1_messages(req: AnthropicRequest):
+    """Anthropic Messages API compatibility endpoint.
+
+    Accepts the Anthropic SDK wire format and maps it to MLXr's chat pipeline.
+    Enables Claude Code, some agent frameworks, and Cursor's native Anthropic
+    mode to use locally-hosted MLX models without an adapter.
+    """
+    cur = engine.current
+    if not cur:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=529,
+            content={"type": "error", "error": {
+                "type": "overloaded_error",
+                "message": "No model is loaded in MLXr. Load one from the dashboard first.",
+            }},
+        )
+
+    saved = settings.get_model(cur.name)
+    alias = saved.get("alias")
+    model_id = req.model or alias or cur.name
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    # Convert Anthropic format to OpenAI messages.
+    messages = _anth_messages_to_oai(req.messages, req.system)
+    oai_tools: Optional[list[dict]] = _anth_tools_to_oai(req.tools) if req.tools else None
+
+    # tool_choice mapping: Anthropic → OAI
+    tool_choice: Any = "auto"
+    if req.tool_choice:
+        tc = req.tool_choice if isinstance(req.tool_choice, dict) else {}
+        tc_type = tc.get("type", "auto")
+        if tc_type == "any":
+            tool_choice = "required"
+        elif tc_type == "tool":
+            tool_choice = {"type": "function", "function": {"name": tc.get("name", "")}}
+        elif tc_type == "none":
+            tool_choice = "none"
+            oai_tools = None
+
+    # Build an internal OAIChatRequest and reuse the existing pipeline.
+    fake_req = OAIChatRequest(
+        model=model_id,
+        messages=[OAIMessage(**m) for m in messages],
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        tools=oai_tools,
+        tool_choice=tool_choice,
+        stream=req.stream,
+    )
+
+    if not any(m["role"] == "system" for m in messages) and saved.get("system"):
+        messages.insert(0, {"role": "system", "content": saved["system"]})
+
+    enable_thinking = not bool(oai_tools)
+    saved_et = saved.get("enable_thinking")
+    if saved_et is not None:
+        enable_thinking = bool(saved_et)
+
+    prompt = _render_chat(cur.tokenizer, messages, tools=oai_tools, enable_thinking=enable_thinking)
+    starts_in_think = _prompt_starts_in_think(prompt)
+
+    client_max = req.max_tokens
+    saved_max = saved.get("max_tokens")
+    resolved_max = client_max or saved_max or (DEFAULT_TOOLS_MAX_TOKENS if oai_tools else DEFAULT_GEN["max_tokens"])
+
+    gen_req = GenerateRequest(
+        prompt="",
+        max_tokens=resolved_max,
+        temperature=req.temperature if req.temperature is not None else saved.get("temperature", DEFAULT_GEN["temperature"]),
+        top_p=req.top_p if req.top_p is not None else saved.get("top_p", DEFAULT_GEN["top_p"]),
+        stream=req.stream,
+    )
+
+    log.info("messages: id=%s model=%s msgs=%d tools=%d stream=%s",
+             msg_id, model_id, len(messages), len(oai_tools or []), req.stream)
+
+    if req.stream:
+        return StreamingResponse(
+            _anth_stream(cur, prompt, gen_req, model_id, msg_id,
+                         bool(oai_tools), starts_in_think),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    text, tokens, finish_reason = await asyncio.to_thread(
+        _generate_blocking, cur, prompt, gen_req, starts_in_think,
+    )
+    cur.generations += 1
+    cur.total_tokens += tokens
+    cur.last_used = time.time()
+
+    # Parse tool calls from the raw output.
+    content_blocks: list[dict] = []
+    tool_calls: list[dict] = []
+    if oai_tools:
+        parser = ToolCallParser(enabled=True)
+        content_txt, tls = parser.feed(text)
+        tail_txt, tail_tls = parser.flush()
+        content_txt = content_txt + tail_txt
+        tool_calls = tls + tail_tls
+        if not tool_calls and content_txt:
+            fallback = ToolCallParser.try_extract_raw_json(content_txt)
+            if fallback:
+                tool_calls = fallback
+                content_txt = ""
+    else:
+        content_txt = text
+
+    cleaned = (content_txt or "").strip()
+    if cleaned:
+        content_blocks.append({"type": "text", "text": cleaned})
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        try:
+            inp = json.loads(fn.get("arguments", "{}"))
+        except Exception:
+            inp = {}
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
+            "name": fn.get("name", ""),
+            "input": inp,
+        })
+
+    stop_reason = _oai_finish_to_anth_stop("tool_calls" if tool_calls else finish_reason)
+    return _build_anth_response(msg_id, model_id, content_blocks, stop_reason, 0, tokens)
+
+
+async def _anth_stream(
+    cur: LoadedModel, prompt: str, req: GenerateRequest,
+    model_id: str, msg_id: str, tools_active: bool, starts_in_think: bool,
+) -> AsyncIterator[bytes]:
+    """Stream Anthropic SSE events for /v1/messages."""
+
+    def sse(event: str, data: dict) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+    # message_start
+    yield sse("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "content": [], "model": model_id,
+            "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 1},
+        },
+    })
+    yield sse("content_block_start", {
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    })
+    yield sse("ping", {"type": "ping"})
+
+    # Re-use the OpenAI streaming helper and translate deltas.
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    sentinel = object()
+
+    def worker():
+        t0 = time.time()
+        with engine.gen_lock:
+            waited = time.time() - t0
+            if waited > 0.1:
+                log.info("MLX (anth stream) queued for %.1fs", waited)
+            try:
+                iterator = _make_iterator(cur, prompt, req)
+                for c in iterator:
+                    piece = getattr(c, "text", c) if not isinstance(c, str) else c
+                    if piece:
+                        asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
+                    fr = getattr(c, "finish_reason", None)
+                    if fr:
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put({"__finish_reason__": fr}), loop)
+            except Exception as e:
+                asyncio.run_coroutine_threadsafe(queue.put({"__error__": str(e)}), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(sentinel), loop)
+
+    loop.run_in_executor(None, worker)
+
+    stripper = ThinkStripper(
+        enabled=_strip_thinking_enabled(cur),
+        starts_in_think=starts_in_think,
+    )
+    tool_parser = ToolCallParser(enabled=tools_active)
+    finish_reason = "stop"
+    token_count = 0
+    text_block_idx = 0
+    tool_blocks: list[dict] = []   # completed tool calls to emit at end
+
+    # Buffer for bare-JSON tool detection (same pattern as _oai_stream_chat).
+    rj_buf: list[str] = []
+    rj_streaming = not tools_active
+    RJ_BUF_MAX = 4096
+
+    while True:
+        item = await queue.get()
+        if item is sentinel:
+            break
+        if isinstance(item, dict) and "__finish_reason__" in item:
+            finish_reason = item["__finish_reason__"]
+            continue
+        if isinstance(item, dict) and "__error__" in item:
+            log.warning("anth stream error: %s", item["__error__"])
+            break
+        token_count += 1
+        visible = stripper.feed(item)
+        if not visible:
+            continue
+        content, new_tools = tool_parser.feed(visible)
+        if new_tools and not rj_streaming:
+            rj_streaming = True
+            if rj_buf:
+                txt = "".join(rj_buf); rj_buf.clear()
+                yield sse("content_block_delta", {
+                    "type": "content_block_delta", "index": text_block_idx,
+                    "delta": {"type": "text_delta", "text": txt},
+                })
+        if content:
+            if rj_streaming:
+                yield sse("content_block_delta", {
+                    "type": "content_block_delta", "index": text_block_idx,
+                    "delta": {"type": "text_delta", "text": content},
+                })
+            else:
+                combined = "".join(rj_buf) + content
+                fv = combined.lstrip()
+                if fv and fv[0] != "{":
+                    rj_streaming = True
+                    yield sse("content_block_delta", {
+                        "type": "content_block_delta", "index": text_block_idx,
+                        "delta": {"type": "text_delta", "text": combined},
+                    })
+                    rj_buf.clear()
+                else:
+                    rj_buf.append(content)
+                    if len("".join(rj_buf)) > RJ_BUF_MAX:
+                        rj_streaming = True
+                        combined = "".join(rj_buf); rj_buf.clear()
+                        yield sse("content_block_delta", {
+                            "type": "content_block_delta", "index": text_block_idx,
+                            "delta": {"type": "text_delta", "text": combined},
+                        })
+        tool_blocks.extend(new_tools)
+
+    # Flush remaining
+    tail_str = stripper.flush()
+    if tail_str:
+        ct, nt = tool_parser.feed(tail_str)
+        if ct:
+            if rj_streaming:
+                yield sse("content_block_delta", {
+                    "type": "content_block_delta", "index": text_block_idx,
+                    "delta": {"type": "text_delta", "text": ct},
+                })
+            else:
+                rj_buf.append(ct)
+        tool_blocks.extend(nt)
+    pt, trailing = tool_parser.flush()
+    if pt:
+        if rj_streaming:
+            yield sse("content_block_delta", {
+                "type": "content_block_delta", "index": text_block_idx,
+                "delta": {"type": "text_delta", "text": pt},
+            })
+        else:
+            rj_buf.append(pt)
+    tool_blocks.extend(trailing)
+
+    # Bare-JSON fallback.
+    if rj_buf and not rj_streaming and not tool_blocks:
+        full = "".join(rj_buf); rj_buf.clear()
+        fb = ToolCallParser.try_extract_raw_json(full)
+        if fb:
+            tool_blocks.extend(fb)
+        else:
+            yield sse("content_block_delta", {
+                "type": "content_block_delta", "index": text_block_idx,
+                "delta": {"type": "text_delta", "text": full},
+            })
+
+    # Close text block.
+    yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx})
+
+    # Emit tool_use blocks (Anthropic format).
+    for i, tc in enumerate(tool_blocks, start=text_block_idx + 1):
+        fn = tc.get("function", {})
+        try:
+            inp = json.loads(fn.get("arguments", "{}"))
+        except Exception:
+            inp = {}
+        yield sse("content_block_start", {
+            "type": "content_block_start", "index": i,
+            "content_block": {
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
+                "name": fn.get("name", ""),
+                "input": {},
+            },
+        })
+        yield sse("content_block_delta", {
+            "type": "content_block_delta", "index": i,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(inp)},
+        })
+        yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+
+    stop_reason = _oai_finish_to_anth_stop(
+        "tool_calls" if tool_blocks else finish_reason
+    )
+    yield sse("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": token_count},
+    })
+    yield sse("message_stop", {"type": "message_stop"})
+
+    cur.generations += 1
+    cur.total_tokens += token_count
+    cur.last_used = time.time()
+
+
+# ---- Embeddings API (/v1/embeddings) --------------------------------------
+# Serves text-embedding models loaded through mlx-lm (BGE, nomic-embed, etc.)
+# using a best-effort strategy:
+#   1. model.encode() — BERT/encoder models loaded via mlx-lm
+#   2. mean-pool of embed_tokens — generative LLMs (less accurate but functional)
+# Normalises all embeddings to unit length (L2) before returning.
+
+
+class EmbeddingRequest(BaseModel):
+    model: Optional[str] = None
+    input: Any  # str | list[str] | list[int] (token IDs — not supported, ignored)
+    encoding_format: str = "float"   # "float" | "base64"
+    dimensions: Optional[int] = None  # truncate if set
+    model_config = {"extra": "ignore"}
+
+
+def _embed_texts(cur: LoadedModel, texts: list[str], encoding_format: str = "float") -> list:
+    """Compute normalised embeddings for a list of texts.
+
+    Returns a list of embedding vectors (float lists) or base64 strings.
+    Raises ValueError if the model architecture is not supported.
+    """
+    import mlx.core as mx
+
+    model = cur.model
+    tokenizer = cur.tokenizer
+    results = []
+
+    for text in texts:
+        # Tokenise — use padding/truncation when available.
+        try:
+            toks = tokenizer(
+                text, return_tensors="mlx",
+                padding=True, truncation=True, max_length=512,
+            )
+        except Exception:
+            toks = tokenizer(text, return_tensors="mlx")
+
+        input_ids = toks["input_ids"]
+
+        # Strategy 1: dedicated encode() method (some mlx-lm encoder models).
+        if hasattr(model, "encode"):
+            emb = model.encode(input_ids)
+            if emb.ndim > 1:
+                emb = emb[0]
+        else:
+            # Strategy 2: mean-pool the token embedding table (works for any
+            # generative LLM — less precise but gives useful dense vectors).
+            embed_fn = (
+                getattr(getattr(model, "model", None), "embed_tokens", None)
+                or getattr(model, "embed_tokens", None)
+                or getattr(getattr(model, "model", None), "embed", None)
+            )
+            if embed_fn is None:
+                raise ValueError(
+                    "This model does not expose an embedding layer. "
+                    "Load a dedicated embedding model (BGE, nomic-embed, etc.)."
+                )
+            hidden = embed_fn(input_ids)   # (1, seq_len, dim)
+            mx.eval(hidden)
+            mask = toks.get("attention_mask")
+            if mask is not None:
+                m_f = mask.astype(mx.float32)[:, :, None]
+                emb = (hidden * m_f).sum(axis=1) / mx.clip(m_f.sum(axis=1), 1e-9, None)
+            else:
+                emb = hidden.mean(axis=1)
+            emb = emb[0]  # (dim,)
+
+        # L2 normalise.
+        mx.eval(emb)
+        norm = mx.sqrt((emb * emb).sum())
+        emb = emb / (norm + 1e-8)
+        mx.eval(emb)
+
+        vec = emb.tolist()
+        if encoding_format == "base64":
+            import base64
+            import struct
+            raw = struct.pack(f"{len(vec)}f", *vec)
+            results.append(base64.b64encode(raw).decode())
+        else:
+            results.append(vec)
+
+    return results
+
+
+@app.post("/v1/embeddings")
+async def v1_embeddings(req: EmbeddingRequest):
+    """OpenAI-compatible embeddings endpoint.
+
+    Works best with a dedicated embedding model (BGE, nomic-embed-text, etc.)
+    loaded through mlx-lm.  Falls back to mean-pooling the token embedding
+    table for generative LLMs, which provides useful-but-not-fine-tuned vectors.
+    """
+    cur = engine.current
+    if not cur:
+        return _oai_error(503, "no_model_loaded", "No model loaded. Load one from the dashboard.")
+
+    # Normalise input to a list of strings.
+    inp = req.input
+    if isinstance(inp, str):
+        texts = [inp]
+    elif isinstance(inp, list) and inp and isinstance(inp[0], int):
+        # Token-ID lists: decode back to string (best-effort).
+        try:
+            texts = [cur.tokenizer.decode(inp)]
+        except Exception:
+            return _oai_error(400, "unsupported_input", "Token-ID input lists are not supported; send text strings.")
+    elif isinstance(inp, list):
+        texts = [str(t) for t in inp]
+    else:
+        return _oai_error(400, "invalid_input", "input must be a string or list of strings.")
+
+    try:
+        vecs = await asyncio.to_thread(_embed_texts, cur, texts, req.encoding_format)
+    except ValueError as e:
+        return _oai_error(422, "embedding_unsupported", str(e))
+    except Exception as e:
+        log.exception("embeddings failed")
+        return _oai_error(500, "embedding_error", f"Embedding failed: {e}")
+
+    saved = settings.get_model(cur.name)
+    model_id = req.model or saved.get("alias") or cur.name
+    data = [
+        {"object": "embedding", "index": i, "embedding": v}
+        for i, v in enumerate(vecs)
+    ]
+    total_tokens = sum(len(cur.tokenizer.encode(t)) for t in texts)
+    return {
+        "object": "list",
+        "data": data,
+        "model": model_id,
+        "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+    }
+
+
+# ---- Benchmark API (/api/benchmark) ----------------------------------------
+# Run N timed inference passes and return throughput stats via SSE so the UI
+# can show a live progress bar + per-run timings.
+
+
+class BenchmarkRequest(BaseModel):
+    prompt: str = "Explain in detail how Apple Silicon M-series chips achieve high efficiency."
+    max_tokens: int = Field(default=150, ge=10, le=2048)
+    runs: int = Field(default=3, ge=1, le=10)
+    temperature: Optional[float] = Field(default=0.0, ge=0.0, le=2.0)
+
+
+@app.post("/api/benchmark")
+async def api_benchmark(req: BenchmarkRequest):
+    """Run N timed generations and stream per-run results + a summary."""
+    cur = engine.current
+    if not cur:
+        raise HTTPException(status_code=409, detail="No model loaded.")
+    return StreamingResponse(
+        _benchmark_stream(cur, req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _benchmark_stream(cur: LoadedModel, req: BenchmarkRequest) -> AsyncIterator[bytes]:
+    """Stream benchmark progress events then a summary."""
+    saved = settings.get_model(cur.name)
+    sys_prompt = saved.get("system")
+    rendered = _render_prompt(cur.tokenizer, req.prompt, sys_prompt)
+    gen_req = GenerateRequest(
+        prompt=rendered,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature if req.temperature is not None else 0.0,
+        top_p=saved.get("top_p", 0.95),
+        stream=False,
+    )
+
+    yield f"event: start\ndata: {json.dumps({'runs': req.runs, 'max_tokens': req.max_tokens})}\n\n".encode()
+
+    ttfts: list[float] = []
+    tpss: list[float] = []
+    token_counts: list[int] = []
+
+    for i in range(req.runs):
+        yield f"event: run_start\ndata: {json.dumps({'run': i + 1, 'of': req.runs})}\n\n".encode()
+
+        t_wall_start = time.time()
+        try:
+            _text, tokens, _fr = await asyncio.to_thread(
+                _generate_blocking, cur, rendered, gen_req, False,
+            )
+            ttft = cur.last_ttft
+            tps = cur.last_tps
+        except Exception as e:
+            yield f"event: run_error\ndata: {json.dumps({'run': i + 1, 'error': str(e)})}\n\n".encode()
+            continue
+
+        wall = time.time() - t_wall_start
+        ttfts.append(ttft or 0.0)
+        tpss.append(tps or 0.0)
+        token_counts.append(tokens)
+        yield f"event: run_done\ndata: {json.dumps({'run': i + 1, 'tokens': tokens, 'wall_s': round(wall, 3), 'ttft_ms': round((ttft or 0) * 1000, 1), 'tps': round(tps or 0, 1)})}\n\n".encode()
+
+    if ttfts:
+        summary = {
+            "runs": len(ttfts),
+            "avg_ttft_ms": round(sum(ttfts) / len(ttfts) * 1000, 1),
+            "min_ttft_ms": round(min(ttfts) * 1000, 1),
+            "max_ttft_ms": round(max(ttfts) * 1000, 1),
+            "avg_tps": round(sum(tpss) / len(tpss), 1),
+            "max_tps": round(max(tpss), 1),
+            "avg_tokens": round(sum(token_counts) / len(token_counts), 1),
+        }
+    else:
+        summary = {"runs": 0, "error": "all runs failed"}
+    yield f"event: summary\ndata: {json.dumps(summary)}\n\n".encode()
+
+    cur.last_used = time.time()
+
+
 # ---- static dashboard ----------------------------------------------------
 
 
 @app.middleware("http")
 async def _request_logger(request, call_next):
-    """Log incoming /v1/ requests and any error responses so client issues are
-    visible in the server log without needing a separate proxy."""
+    """Log incoming /v1/ requests and enforce optional API-key auth.
+
+    API-key gate: if MLXR_API_KEY is set in the environment, every /v1/ request
+    must carry a matching ``Authorization: Bearer <key>`` header (or an
+    ``x-api-key: <key>`` header for Anthropic-SDK compatibility). Dashboard
+    routes (/api/, static assets) are never gated.
+    """
     path = request.url.path
+
+    # ── API-key check ────────────────────────────────────────────────────────
+    if _API_KEY and path.startswith("/v1/"):
+        auth_header = request.headers.get("authorization", "")
+        xapi = request.headers.get("x-api-key", "")
+        provided = ""
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header[7:].strip()
+        elif xapi:
+            provided = xapi.strip()
+        if provided != _API_KEY:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=401,
+                content={"error": {
+                    "message": "Invalid API key. Set MLXR_API_KEY on the server to the same value as your client's key.",
+                    "type": "authentication_error",
+                    "code": "invalid_api_key",
+                }},
+            )
+
     if path.startswith("/v1/"):
         body = await request.body()
         log.info("v1 request: %s %s body=%r", request.method, path, body[:1000] if body else b"")
