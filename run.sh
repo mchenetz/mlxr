@@ -1,8 +1,41 @@
 #!/usr/bin/env bash
 # Bootstrap + launch MLXr. Requires Apple Silicon + Python 3.10+.
 # Loops on exit code 42 so the dashboard can self-restart after upgrades.
+#
+# Usage:
+#   ./run.sh [--port PORT] [--host HOST]
+#
+# Options:
+#   --port PORT   Port to listen on (default: $MLXR_PORT or 8000)
+#   --host HOST   Bind address   (default: $MLXR_HOST or 127.0.0.1)
+#   --help        Show this message
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# ── CLI argument parsing ────────────────────────────────────────────────────
+_CLI_PORT=""
+_CLI_HOST=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port)
+      [[ -z "${2-}" ]] && { echo "Error: --port requires a value" >&2; exit 1; }
+      _CLI_PORT="$2"; shift 2 ;;
+    --port=*)
+      _CLI_PORT="${1#--port=}"; shift ;;
+    --host)
+      [[ -z "${2-}" ]] && { echo "Error: --host requires a value" >&2; exit 1; }
+      _CLI_HOST="$2"; shift 2 ;;
+    --host=*)
+      _CLI_HOST="${1#--host=}"; shift ;;
+    --help|-h)
+      sed -n '2,/^set -/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)
+      echo "Error: unknown argument '$1'  (try --help)" >&2; exit 1 ;;
+  esac
+done
+# ───────────────────────────────────────────────────────────────────────────
 
 MIN_PY="(3, 10)"
 
@@ -56,8 +89,9 @@ source .venv/bin/activate
 pip install --upgrade pip >/dev/null
 pip install -r requirements.txt
 
-HOST="${MLXR_HOST:-127.0.0.1}"
-PORT="${MLXR_PORT:-8000}"
+# Priority: CLI flag > env var > built-in default.
+HOST="${_CLI_HOST:-${MLXR_HOST:-127.0.0.1}}"
+PORT="${_CLI_PORT:-${MLXR_PORT:-8000}}"
 export MLXR_MANAGED=1
 
 while true; do
