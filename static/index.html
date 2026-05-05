@@ -225,6 +225,34 @@
       </section>
 
       <section class="card span-2">
+        <h2>Tool-Call Mappings <span id="mappingsBadge" class="badge">—</span></h2>
+        <p class="muted" style="margin:0 0 12px">Per-model format definitions that control how tool calls are parsed from raw model output. Built-in mappings cover known families; add custom ones or auto-detect for the loaded model.</p>
+        <div class="row" style="margin-bottom:10px">
+          <button id="probeBtn" class="primary">Auto-detect for Loaded Model</button>
+          <button id="mappingsRefreshBtn">Refresh</button>
+          <button id="mappingsImportBtn">Import File</button>
+          <input id="mappingsImportFile" type="file" accept=".json,.yaml,.yml" style="display:none" />
+          <button id="mappingsExportBtn">Export User Mappings</button>
+          <span id="mappingsHint" class="muted"></span>
+        </div>
+        <div id="probeArea" class="hidden" style="margin-bottom:12px;border:1px solid var(--border,#ddd);border-radius:6px;padding:12px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <strong>Raw Model Output</strong>
+            <span id="probeConfidenceBadge" class="badge"></span>
+          </div>
+          <pre id="probeRaw" class="output mini-output" style="max-height:100px;margin:0 0 8px"></pre>
+          <strong>Draft Mapping JSON</strong> <span class="muted" style="font-size:12px">— review and edit before saving</span>
+          <textarea id="probeDraftJson" rows="10" style="width:100%;font-family:monospace;font-size:12px;margin-top:4px;box-sizing:border-box"></textarea>
+          <div class="row" style="margin-top:6px">
+            <button id="probeSaveBtn" class="primary">Save Mapping</button>
+            <button id="probeDiscardBtn">Discard</button>
+            <span id="probeSaveHint" class="muted"></span>
+          </div>
+        </div>
+        <div id="mappingsList"></div>
+      </section>
+
+      <section class="card span-2">
         <h2>Benchmark</h2>
         <p class="muted" style="margin: 0 0 12px">Measure TTFT and throughput for the loaded model. Runs N back-to-back generations and reports per-run timings and averages.</p>
         <div class="controls">

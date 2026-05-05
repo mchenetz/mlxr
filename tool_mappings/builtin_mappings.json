@@ -1,0 +1,114 @@
+{
+  "version": "1",
+  "mappings": [
+    {
+      "id": "qwen3-hermes-json",
+      "name": "Qwen2.5 / Qwen3 / Hermes-3 / Phi-4 (JSON body)",
+      "version": "1.0.0",
+      "description": "Tag-pair format used by Qwen2.5, Qwen3, Hermes-3, NousResearch, and Phi-4-mini models. The body between the tags is a JSON object with 'name' and 'arguments'/'parameters' keys.",
+      "match_globs": ["*qwen*", "*hermes*", "*nousresearch*", "*phi-4*", "*phi4*"],
+      "detection": {
+        "strategy": "tag_pair_and_bare_json",
+        "tag_pairs": [
+          {"open": "<tool_call>", "close": "</tool_call>"},
+          {"open": "<|tool_call|>", "close": "<|/tool_call|>"},
+          {"open": "<function_call>", "close": "</function_call>"},
+          {"open": "<tool_call_begin>", "close": "<tool_call_end>"},
+          {"open": "<|tool_call_begin|>", "close": "<|tool_call_end|>"}
+        ],
+        "bare_json_signal": {
+          "required_keys": ["name"],
+          "argument_keys": ["arguments", "parameters"]
+        }
+      },
+      "body_format": {
+        "type": "json_object",
+        "json_name_key": "name",
+        "json_args_keys": ["arguments", "parameters"]
+      },
+      "output": {"arguments_encoding": "json_string", "id_prefix": "call_"}
+    },
+    {
+      "id": "qwen3-xml",
+      "name": "Qwen3 XML function/parameter tags",
+      "version": "1.0.0",
+      "description": "Qwen3 models sometimes emit tool calls as XML with <function=NAME><parameter=KEY>VALUE</parameter></function> syntax inside <tool_call> tags. Detected by the XML body format rather than JSON.",
+      "match_globs": ["*qwen3*"],
+      "detection": {
+        "strategy": "tag_pair_and_bare_json",
+        "tag_pairs": [
+          {"open": "<tool_call>", "close": "</tool_call>"},
+          {"open": "<|tool_call|>", "close": "<|/tool_call|>"}
+        ],
+        "bare_json_signal": {
+          "required_keys": ["name"],
+          "argument_keys": ["arguments", "parameters"]
+        }
+      },
+      "body_format": {
+        "type": "xml_function_tag",
+        "xml_function_open_re": "<function\\s*=\\s*[\"']?(?P<name>[^\\s\"'>]+)[\"']?\\s*>",
+        "xml_parameter_open_re": "<parameter\\s*=\\s*[\"']?(?P<key>[^\\s\"'>]+)[\"']?\\s*>"
+      },
+      "output": {"arguments_encoding": "json_string", "id_prefix": "call_"}
+    },
+    {
+      "id": "deepseek-v3",
+      "name": "DeepSeek-V2 / V3 / R1",
+      "version": "1.0.0",
+      "description": "DeepSeek models use Unicode fullwidth-pipe delimiter tokens. Each call is wrapped in <｜tool▁call▁begin｜>/<｜tool▁call▁end｜> with a type<｜tool▁sep｜>NAME body followed by a fenced JSON block.",
+      "match_globs": ["*deepseek*"],
+      "detection": {
+        "strategy": "tag_pair",
+        "tag_pairs": [
+          {"open": "<｜tool▁call▁begin｜>", "close": "<｜tool▁call▁end｜>"}
+        ]
+      },
+      "body_format": {
+        "type": "deepseek_sep",
+        "deepseek_separator": "<｜tool▁sep｜>",
+        "fenced_languages": ["json"]
+      },
+      "output": {"arguments_encoding": "json_string", "id_prefix": "call_"}
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral / Mixtral",
+      "version": "1.0.0",
+      "description": "Mistral models use [TOOL_CALLS][{...}] format. The close tag [/TOOL_CALLS] never actually appears so flush() handles the open buffer.",
+      "match_globs": ["*mistral*", "*mixtral*"],
+      "detection": {
+        "strategy": "tag_pair",
+        "tag_pairs": [
+          {"open": "[TOOL_CALLS]", "close": "[/TOOL_CALLS]"}
+        ]
+      },
+      "body_format": {
+        "type": "json_object",
+        "json_name_key": "name",
+        "json_args_keys": ["arguments", "parameters"]
+      },
+      "output": {"arguments_encoding": "json_string", "id_prefix": "call_"}
+    },
+    {
+      "id": "llama3-bare-json",
+      "name": "Llama 3.x / Gemma 3 (bare JSON)",
+      "version": "1.0.0",
+      "description": "Llama 3.x and Gemma 3 models using the default chat template emit bare JSON objects with no wrapper tags. Detected by key-presence heuristic on the full output.",
+      "match_globs": ["*llama-3*", "*llama3*", "*gemma-3*", "*gemma3*"],
+      "detection": {
+        "strategy": "bare_json",
+        "bare_json_signal": {
+          "required_keys": ["name"],
+          "argument_keys": ["arguments", "parameters"]
+        }
+      },
+      "body_format": {
+        "type": "json_object",
+        "json_name_key": "name",
+        "json_args_keys": ["arguments", "parameters"]
+      },
+      "output": {"arguments_encoding": "json_string", "id_prefix": "call_"}
+    }
+  ]
+}

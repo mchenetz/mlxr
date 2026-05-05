@@ -915,6 +915,145 @@ function renderRecentRequests(items) {
   }
 }
 
+// ---- Tool-Call Mappings panel ------------------------------------------
+
+$("probeBtn").addEventListener("click", runProbe);
+$("mappingsRefreshBtn").addEventListener("click", refreshMappings);
+$("mappingsImportBtn").addEventListener("click", () => $("mappingsImportFile").click());
+$("mappingsImportFile").addEventListener("change", importMappings);
+$("mappingsExportBtn").addEventListener("click", exportMappings);
+$("probeSaveBtn").addEventListener("click", saveDraftMapping);
+$("probeDiscardBtn").addEventListener("click", () => {
+  $("probeArea").classList.add("hidden");
+  $("probeDraftJson").value = "";
+});
+
+async function refreshMappings() {
+  const hint = $("mappingsHint");
+  try {
+    const data = await api("/api/tool-mappings");
+    const list = data.mappings || [];
+    $("mappingsBadge").textContent = list.length;
+    renderMappingsList(list);
+  } catch (e) {
+    hint.textContent = "Load failed: " + e.message;
+  }
+}
+
+function renderMappingsList(mappings) {
+  const el = $("mappingsList");
+  if (!mappings.length) { el.innerHTML = '<p class="muted">No mappings defined.</p>'; return; }
+  const rows = mappings.map(m => {
+    const tag = m.is_builtin
+      ? '<span class="badge" style="background:var(--accent-muted,#e8f4ff);color:#0066cc">builtin</span>'
+      : '<span class="badge" style="background:#e8ffe8;color:#006600">user</span>';
+    const del = m.is_builtin ? "" :
+      `<button class="del-mapping" data-id="${m.id}" style="padding:2px 8px;font-size:11px">✕</button>`;
+    const globs = (m.match_globs || []).join(", ");
+    return `<tr>
+      <td class="pkg">${tag} <strong>${escHtml(m.name)}</strong></td>
+      <td class="ver" style="font-size:12px;color:#666">${escHtml(m.id)}</td>
+      <td class="ver mono" style="font-size:11px">${escHtml(globs)}</td>
+      <td class="status">${del}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<table class="vtable"><thead><tr>
+    <th>Name</th><th>ID</th><th>Globs</th><th></th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+  el.querySelectorAll(".del-mapping").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!confirm(`Delete mapping "${btn.dataset.id}"?`)) return;
+      try {
+        await api("/api/tool-mappings/" + btn.dataset.id, { method: "DELETE" });
+        toast("Mapping deleted");
+        refreshMappings();
+      } catch (e) { toast("Delete failed: " + e.message, "err"); }
+    });
+  });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+async function runProbe() {
+  const btn = $("probeBtn");
+  const hint = $("mappingsHint");
+  btn.disabled = true;
+  hint.textContent = "Running probe…";
+  $("probeArea").classList.add("hidden");
+  try {
+    const data = await api("/api/tool-mappings/probe", { method: "POST" });
+    $("probeRaw").textContent = data.raw_output || "";
+    $("probeDraftJson").value = JSON.stringify(data.draft_mapping, null, 2);
+    const badge = $("probeConfidenceBadge");
+    badge.textContent = data.confidence || "unknown";
+    badge.style.background = data.confidence === "heuristic" ? "#e8ffe8" : "#fff8e0";
+    badge.style.color = data.confidence === "heuristic" ? "#006600" : "#886600";
+    $("probeArea").classList.remove("hidden");
+    hint.textContent = "Draft mapping ready — review and save.";
+  } catch (e) {
+    hint.textContent = "Probe failed: " + e.message;
+    toast("Probe failed: " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function saveDraftMapping() {
+  const hint = $("probeSaveHint");
+  hint.textContent = "Saving…";
+  let parsed;
+  try { parsed = JSON.parse($("probeDraftJson").value); }
+  catch (e) { hint.textContent = "Invalid JSON: " + e.message; return; }
+  try {
+    const r = await api("/api/tool-mappings", { method: "POST", body: JSON.stringify(parsed) });
+    hint.textContent = "Saved: " + r.id;
+    toast("Mapping saved: " + r.id);
+    $("probeArea").classList.add("hidden");
+    refreshMappings();
+  } catch (e) {
+    hint.textContent = "Save failed: " + e.message;
+    toast("Save failed: " + e.message, "err");
+  }
+}
+
+async function importMappings() {
+  const file = $("mappingsImportFile").files[0];
+  if (!file) return;
+  const hint = $("mappingsHint");
+  hint.textContent = "Importing…";
+  try {
+    const text = await file.text();
+    const r = await api("/api/tool-mappings/import", {
+      method: "POST",
+      body: JSON.stringify({ content: text, filename: file.name }),
+    });
+    hint.textContent = `Imported ${r.imported} mapping(s).`;
+    toast(`Imported ${r.imported} mapping(s)`);
+    refreshMappings();
+  } catch (e) {
+    hint.textContent = "Import failed: " + e.message;
+    toast("Import failed: " + e.message, "err");
+  }
+  $("mappingsImportFile").value = "";
+}
+
+async function exportMappings() {
+  try {
+    const resp = await fetch("/api/tool-mappings/export");
+    if (!resp.ok) throw new Error(resp.statusText);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "tool_mappings.json"; a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { toast("Export failed: " + e.message, "err"); }
+}
+
+// Kick off on load
+refreshMappings();
+
 // ---- Benchmark panel ---------------------------------------------------
 
 let _benchController = null;

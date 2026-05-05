@@ -927,6 +927,10 @@ async def _idle_unload_task() -> None:
 
 @app.on_event("startup")
 async def _autoload_on_start() -> None:
+    # Warm up the tool-mapping registry singleton (loads builtin_mappings.json).
+    from tool_mappings import get_registry
+    get_registry()
+
     name = settings.autoload_name()
     if name:
         log.info("Autoloading %s per settings", name)
@@ -2810,7 +2814,10 @@ async def v1_chat_completions(req: OAIChatRequest):
     tool_calls: list[dict] = []
     content_text = text
     if tools_active:
-        parser = ToolCallParser(enabled=True)
+        from tool_mappings import get_registry
+        from tool_mappings.converter import MappedToolCallParser
+        _mapping = get_registry().resolve(cur.name)
+        parser = MappedToolCallParser(enabled=True, mapping=_mapping)
         content, tools_in_stream = parser.feed(text)
         tail_content, tail_tools = parser.flush()
         content_text = content + tail_content
@@ -2819,7 +2826,7 @@ async def v1_chat_completions(req: OAIChatRequest):
         # object with no wrapper tags.  Only fires when the parser found no
         # tagged tool calls and the entire output looks like a JSON tool call.
         if not tool_calls and content_text:
-            fallback = ToolCallParser.try_extract_raw_json(content_text)
+            fallback = MappedToolCallParser.try_extract_raw_json(content_text, mapping=_mapping)
             if fallback:
                 tool_calls = fallback
                 content_text = ""
@@ -3078,7 +3085,10 @@ async def _oai_stream_chat(
         enabled=_strip_thinking_enabled(cur),
         starts_in_think=starts_in_think,
     )
-    tool_parser = ToolCallParser(enabled=tools_active)
+    from tool_mappings import get_registry
+    from tool_mappings.converter import MappedToolCallParser
+    _oai_mapping = get_registry().resolve(cur.name) if tools_active else None
+    tool_parser = MappedToolCallParser(enabled=tools_active, mapping=_oai_mapping)
     tool_index = 0
     tools_emitted = 0
     finish_reason = "stop"
@@ -3214,7 +3224,7 @@ async def _oai_stream_chat(
     if rj_buf and not rj_streaming and tools_emitted == 0:
         full_content = "".join(rj_buf)
         rj_buf.clear()
-        fallback = ToolCallParser.try_extract_raw_json(full_content)
+        fallback = MappedToolCallParser.try_extract_raw_json(full_content, mapping=_oai_mapping)
         if fallback:
             log.info(
                 "chat: id=%s raw-JSON tool call detected in stream (Llama/bare-JSON fallback)",
@@ -3640,13 +3650,16 @@ async def v1_messages(req: AnthropicRequest):
     content_blocks: list[dict] = []
     tool_calls: list[dict] = []
     if oai_tools:
-        parser = ToolCallParser(enabled=True)
+        from tool_mappings import get_registry
+        from tool_mappings.converter import MappedToolCallParser
+        _anth_mapping = get_registry().resolve(cur.name)
+        parser = MappedToolCallParser(enabled=True, mapping=_anth_mapping)
         content_txt, tls = parser.feed(text)
         tail_txt, tail_tls = parser.flush()
         content_txt = content_txt + tail_txt
         tool_calls = tls + tail_tls
         if not tool_calls and content_txt:
-            fallback = ToolCallParser.try_extract_raw_json(content_txt)
+            fallback = MappedToolCallParser.try_extract_raw_json(content_txt, mapping=_anth_mapping)
             if fallback:
                 tool_calls = fallback
                 content_txt = ""
@@ -3730,7 +3743,10 @@ async def _anth_stream(
         enabled=_strip_thinking_enabled(cur),
         starts_in_think=starts_in_think,
     )
-    tool_parser = ToolCallParser(enabled=tools_active)
+    from tool_mappings import get_registry
+    from tool_mappings.converter import MappedToolCallParser
+    _anth_stream_mapping = get_registry().resolve(cur.name) if tools_active else None
+    tool_parser = MappedToolCallParser(enabled=tools_active, mapping=_anth_stream_mapping)
     finish_reason = "stop"
     token_count = 0
     text_block_idx = 0
@@ -3818,7 +3834,7 @@ async def _anth_stream(
     # Bare-JSON fallback.
     if rj_buf and not rj_streaming and not tool_blocks:
         full = "".join(rj_buf); rj_buf.clear()
-        fb = ToolCallParser.try_extract_raw_json(full)
+        fb = MappedToolCallParser.try_extract_raw_json(full, mapping=_anth_stream_mapping)
         if fb:
             tool_blocks.extend(fb)
         else:
@@ -4226,6 +4242,151 @@ async def api_kvcache_clear(req: KVClearRequest) -> dict:
     result = await asyncio.to_thread(kvc.clear, req.model)
     log.info("kvc: cleared %s — %s", req.model or "all", result)
     return {"ok": True, **result}
+
+
+# ---- tool mappings ----------------------------------------------------------
+
+@app.get("/api/tool-mappings")
+def api_tool_mappings_list() -> dict:
+    """List all registered tool-call mappings (builtin + user)."""
+    from tool_mappings import get_registry
+    return {"mappings": get_registry().all_mappings()}
+
+
+@app.get("/api/tool-mappings/resolve/{model_name:path}")
+def api_tool_mappings_resolve(model_name: str) -> dict:
+    """Show which mapping would be used for *model_name*."""
+    from tool_mappings import get_registry
+    return get_registry().resolve_info(model_name)
+
+
+@app.get("/api/tool-mappings/export")
+def api_tool_mappings_export() -> Response:
+    """Download all user mappings as a JSON file."""
+    from tool_mappings import get_registry
+    content = get_registry().export_to_json()
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=tool_mappings.json"},
+    )
+
+
+@app.get("/api/tool-mappings/{mapping_id}")
+def api_tool_mappings_get(mapping_id: str) -> dict:
+    """Fetch a single mapping by id."""
+    from tool_mappings import get_registry
+    defn = get_registry().get_by_id(mapping_id)
+    if defn is None:
+        raise HTTPException(status_code=404, detail=f"Mapping '{mapping_id}' not found")
+    d = defn.to_dict()
+    d["is_builtin"] = defn.is_builtin
+    return d
+
+
+@app.post("/api/tool-mappings")
+async def api_tool_mappings_save(body: dict) -> dict:
+    """Create or update a user mapping (upsert by id)."""
+    from tool_mappings import get_registry
+    from tool_mappings.schema import MappingDefinition
+    try:
+        defn = MappingDefinition.from_dict(body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    errs = defn.validate()
+    if errs:
+        raise HTTPException(status_code=422, detail={"errors": errs})
+    get_registry().save_user_mapping(defn)
+    return {"ok": True, "id": defn.id}
+
+
+@app.delete("/api/tool-mappings/{mapping_id}")
+def api_tool_mappings_delete(mapping_id: str) -> dict:
+    """Delete a user-defined mapping by id."""
+    from tool_mappings import get_registry
+    removed = get_registry().delete_user_mapping(mapping_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"User mapping '{mapping_id}' not found")
+    return {"ok": True, "id": mapping_id}
+
+
+class MappingImportBody(BaseModel):
+    content: str          # raw JSON or YAML text
+    filename: str = "upload.json"
+
+
+@app.post("/api/tool-mappings/import")
+async def api_tool_mappings_import(body: MappingImportBody) -> dict:
+    """Import mapping definitions from uploaded JSON/YAML text."""
+    from tool_mappings import get_registry
+    try:
+        imported = get_registry().import_from_text(body.content, body.filename)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"ok": True, "imported": len(imported), "ids": [d.id for d in imported]}
+
+
+@app.post("/api/tool-mappings/probe")
+async def api_tool_mappings_probe() -> dict:
+    """Run the AI mapping creator for the currently loaded model.
+
+    1. Sends a forced tool-call probe request to the loaded model.
+    2. Runs heuristic detection on the raw output.
+    3. Falls back to AI extraction if no heuristic match.
+    Returns raw_output + draft_mapping + confidence for the UI to review.
+    """
+    from tool_mappings import get_registry
+    from tool_mappings.ai_creator import run_probe, derive_mapping
+
+    cur = engine.current()
+    if cur is None:
+        raise HTTPException(status_code=503, detail="No model is loaded. Load a model first.")
+
+    # Build a generate_fn closure that calls the blocking pipeline.
+    def generate_fn(
+        messages: list[dict],
+        tools: list[dict] | None,
+        tool_choice: str | None,
+        max_tokens: int,
+    ) -> str:
+        from server import GenerateRequest, _generate_blocking, _render_chat  # type: ignore
+        # Build prompt
+        prompt = _render_chat(
+            cur.tokenizer,
+            messages,
+            tools=tools,
+            enable_thinking=False,
+        )
+        req = GenerateRequest(
+            prompt="",
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        starts_in_think = prompt.rstrip().endswith("<think>")
+        text, _tokens, _fr = _generate_blocking(cur, prompt, req, starts_in_think, [])
+        return text
+
+    registry = get_registry()
+    existing_ids = [m["id"] for m in registry.all_mappings()]
+
+    try:
+        raw_output = await asyncio.to_thread(run_probe, cur.name, generate_fn)
+        draft, confidence = await asyncio.to_thread(
+            derive_mapping, cur.name, raw_output, generate_fn,
+            existing_ids,
+        )
+    except Exception as exc:
+        log.warning("tool_mappings probe failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "ok": True,
+        "model": cur.name,
+        "raw_output": raw_output,
+        "draft_mapping": draft.to_dict(),
+        "confidence": confidence,
+    }
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
