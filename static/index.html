@@ -50,6 +50,7 @@
               </select>
             </label>
             <label class="checkbox-row"><input id="setAutoload" type="checkbox" /> Autoload this model on server start</label>
+            <label>idle_timeout_minutes <input id="setIdleTimeout" type="number" min="1" max="10080" step="1" placeholder="never" title="Auto-unload after this many minutes of inactivity. Leave blank to keep loaded indefinitely." /></label>
             <div class="row" style="margin-top: 6px;">
               <button id="saveSettingsBtn" class="primary">Save</button>
               <button id="resetSettingsBtn">Reset</button>
@@ -163,6 +164,16 @@
             <ul id="hfCache" class="list"></ul>
           </div>
         </div>
+      </section>
+
+      <section class="card span-2">
+        <h2>Recent Requests <span id="recentRequestsBadge" class="badge" style="display:none"></span></h2>
+        <p class="muted" style="margin: 0 0 10px;">Last 10 <code>/v1/</code> calls — useful for debugging tool calls and inspecting raw model output.</p>
+        <div class="row" style="margin-bottom: 10px;">
+          <button id="refreshRecentBtn">Refresh</button>
+          <span id="recentHint" class="muted"></span>
+        </div>
+        <div id="recentRequestsList"></div>
       </section>
 
       <section class="card span-2">

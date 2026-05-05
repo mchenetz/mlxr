@@ -75,6 +75,9 @@ class LoadedModel:
     generations: int = 0
     total_tokens: int = 0
     last_used: float = field(default_factory=time.time)
+    # Per-generation perf metrics updated after each inference call.
+    last_ttft: Optional[float] = None   # Time To First Token (seconds)
+    last_tps: Optional[float] = None    # tokens / second (generation throughput)
 
 
 def _detect_context_length(tokenizer: Any, model_name: str) -> int:
@@ -467,20 +470,48 @@ settings = Settings(SETTINGS_PATH)
 app = FastAPI(title="MLXr", version="0.1.0")
 
 
+async def _idle_unload_task() -> None:
+    """Background task: auto-unload a model that has been idle past its TTL.
+
+    Checks every 60 seconds. The TTL (``idle_timeout_minutes``) is a per-model
+    setting stored in ~/.mlxr/settings.json. A value of None means 'never
+    auto-unload', preserving backward-compatible behaviour for all existing
+    model configs.
+    """
+    while True:
+        await asyncio.sleep(60)
+        cur = engine.current
+        if cur is None:
+            continue
+        saved = settings.get_model(cur.name)
+        timeout_min = saved.get("idle_timeout_minutes")
+        if timeout_min is None:
+            continue
+        idle_sec = time.time() - cur.last_used
+        if idle_sec >= timeout_min * 60:
+            log.info(
+                "Auto-unloading %s: idle %.1f min ≥ TTL %d min",
+                cur.name, idle_sec / 60, timeout_min,
+            )
+            engine.unload()
+
+
 @app.on_event("startup")
 async def _autoload_on_start() -> None:
     name = settings.autoload_name()
-    if not name:
-        return
-    log.info("Autoloading %s per settings", name)
+    if name:
+        log.info("Autoloading %s per settings", name)
 
-    def _go():
-        try:
-            engine.load(name)
-        except Exception as e:
-            log.warning("autoload failed: %s", e)
+        def _go():
+            try:
+                engine.load(name)
+            except Exception as e:
+                log.warning("autoload failed: %s", e)
 
-    threading.Thread(target=_go, daemon=True).start()
+        threading.Thread(target=_go, daemon=True).start()
+
+    # Background task — runs for the lifetime of the server.
+    asyncio.create_task(_idle_unload_task())
 
 
 # ---- models --------------------------------------------------------------
@@ -495,6 +526,8 @@ class GenerateRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=None, ge=1, le=131072)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    repetition_penalty: Optional[float] = Field(default=None, ge=0.0)
     system: Optional[str] = None
     stream: bool = True
 
@@ -564,6 +597,8 @@ def _model_state() -> dict:
         "total_tokens": cur.total_tokens,
         "last_used": cur.last_used,
         "context_length": cur.context_length,
+        "last_ttft": cur.last_ttft,
+        "last_tps": cur.last_tps,
     }
 
 
@@ -1131,6 +1166,41 @@ class ToolCallParser:
         }
 
 
+def _make_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest):
+    """Build a stream_generate iterator using the best available sampler.
+
+    Tries to pass advanced sampling params (min_p, repetition_penalty) to
+    make_sampler and falls back gracefully when an older mlx-lm doesn't
+    accept them.  Always falls back to the bare temp= kwarg path when
+    make_sampler itself is unavailable.
+    """
+    from mlx_lm import stream_generate
+
+    gen_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "max_tokens": req.max_tokens,
+    }
+    try:
+        from mlx_lm.sample_utils import make_sampler
+
+        sampler_kw: dict[str, Any] = {
+            "temp": req.temperature,
+            "top_p": req.top_p,
+        }
+        if req.min_p is not None:
+            sampler_kw["min_p"] = req.min_p
+        if req.repetition_penalty is not None:
+            sampler_kw["repetition_penalty"] = req.repetition_penalty
+        try:
+            sampler = make_sampler(**sampler_kw)
+        except TypeError:
+            # Older mlx-lm: drop advanced params and retry.
+            sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
+        return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, sampler=sampler)
+    except ImportError:
+        return stream_generate(cur.model, cur.tokenizer, **gen_kwargs, temp=req.temperature)
+
+
 def _strip_thinking_enabled(cur: LoadedModel) -> bool:
     saved = settings.get_model(cur.name)
     # Default ON — mirrors what most proxies do. Users can opt out per model.
@@ -1183,6 +1253,17 @@ def _engine_versions() -> dict:
     out["python_too_old"] = sys.version_info < MIN_PYTHON
     out["python_min"] = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
     return out
+
+
+@app.get("/health")
+def health() -> dict:
+    """Standard health-check used by Docker, Homebrew services, and IDE integrations."""
+    cur = engine.current
+    return {
+        "status": "ok",
+        "model": cur.name if cur else None,
+        "loading": engine.loading,
+    }
 
 
 @app.get("/api/engine/version")
@@ -1385,39 +1466,42 @@ def _generate_blocking(
     cur: LoadedModel, rendered: str, req: GenerateRequest,
     starts_in_think: bool = False,
 ) -> tuple[str, int, str]:
-    """Run blocking generation. Returns (text, token_count, finish_reason)."""
-    from mlx_lm import stream_generate
+    """Run blocking generation. Returns (text, token_count, finish_reason).
+
+    Also updates cur.last_ttft and cur.last_tps so the dashboard can show
+    per-generation performance without needing a separate stats endpoint.
+    """
+    # Build iterator before acquiring the lock — stream_generate is lazy.
+    iterator = _make_iterator(cur, rendered, req)
 
     parts: list[str] = []
     token_count = 0
     finish_reason = "stop"
-
-    try:
-        from mlx_lm.sample_utils import make_sampler
-        sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
-        iterator = stream_generate(
-            cur.model, cur.tokenizer, prompt=rendered,
-            max_tokens=req.max_tokens, sampler=sampler,
-        )
-    except Exception:
-        iterator = stream_generate(
-            cur.model, cur.tokenizer, prompt=rendered,
-            max_tokens=req.max_tokens, temp=req.temperature,
-        )
+    t_first_token: Optional[float] = None
 
     t0 = time.time()
     with engine.gen_lock:
         waited = time.time() - t0
         if waited > 0.1:
             log.info("MLX (blocking) queued for %.1fs before starting", waited)
+        t_gen_start = time.time()
         for c in iterator:
             piece = getattr(c, "text", c) if not isinstance(c, str) else c
             if piece:
+                if t_first_token is None:
+                    t_first_token = time.time()
                 parts.append(piece)
             token_count += 1
             fr = getattr(c, "finish_reason", None)
             if fr:
                 finish_reason = fr
+        t_gen_end = time.time()
+
+    # Store perf metrics on the LoadedModel for dashboard display.
+    if t_first_token is not None:
+        cur.last_ttft = t_first_token - t_gen_start
+    elapsed = t_gen_end - t_gen_start
+    cur.last_tps = token_count / elapsed if elapsed > 0 else None
 
     text = "".join(parts)
     if text:
@@ -1546,6 +1630,12 @@ class OAIChatRequest(BaseModel):
     top_p: Optional[float] = None
     stream: bool = False
     stream_options: Optional[Any] = None  # {"include_usage": bool}
+    # Advanced sampling params — forwarded to mlx-lm make_sampler when supported.
+    min_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    repetition_penalty: Optional[float] = Field(default=None, ge=0.0)
+    # Accepted for OpenAI API compatibility but not forwarded (mlx-lm lacks support).
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
     # Tool use. `tools` follows OpenAI's function-tool schema:
     #   [{"type": "function", "function": {"name": ..., "description": ..., "parameters": <JSON schema>}}]
     tools: Optional[list[dict]] = None
@@ -1577,6 +1667,212 @@ def v1_models() -> dict:
             "context_length": cur.context_length,  # non-standard but useful for clients
         })
     return {"object": "list", "data": data}
+
+
+class OAICompletionRequest(BaseModel):
+    """OpenAI /v1/completions (legacy text-completion) request schema."""
+    model: Optional[str] = None
+    prompt: str
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    min_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    repetition_penalty: Optional[float] = Field(default=None, ge=0.0)
+    stream: bool = False
+    stream_options: Optional[Any] = None
+    suffix: Optional[str] = None   # accepted, not used
+    model_config = {"extra": "ignore"}
+
+    def effective_max_tokens(self) -> Optional[int]:
+        return self.max_completion_tokens or self.max_tokens
+
+    def include_usage(self) -> bool:
+        if isinstance(self.stream_options, dict):
+            return bool(self.stream_options.get("include_usage"))
+        return False
+
+
+@app.post("/v1/completions")
+async def v1_completions(req: OAICompletionRequest):
+    """Legacy raw-text completion endpoint (not chat).
+
+    Passes the prompt straight to the model without any chat template, which
+    is what the OpenAI spec describes.  Useful for Aider's –-model=openai/…
+    mode and other tools that use the older completions API.
+    """
+    cur = engine.current
+    if not cur:
+        return _oai_error(503, "no_model_loaded", "No model is loaded in MLXr. Load one from the dashboard first.")
+
+    saved = settings.get_model(cur.name)
+    model_id = req.model or cur.name
+    completion_id = f"cmpl-{uuid.uuid4().hex[:16]}"
+    created = int(time.time())
+
+    client_max = req.effective_max_tokens()
+    saved_max = saved.get("max_tokens")
+    resolved_max = client_max or saved_max or DEFAULT_GEN["max_tokens"]
+
+    gen_req = GenerateRequest(
+        prompt=req.prompt,
+        max_tokens=resolved_max,
+        temperature=req.temperature if req.temperature is not None else saved.get("temperature", DEFAULT_GEN["temperature"]),
+        top_p=req.top_p if req.top_p is not None else saved.get("top_p", DEFAULT_GEN["top_p"]),
+        min_p=req.min_p,
+        repetition_penalty=req.repetition_penalty,
+        stream=req.stream,
+    )
+
+    if req.stream:
+        return StreamingResponse(
+            _oai_stream_completions(cur, req.prompt, gen_req, model_id, completion_id, created, req.include_usage()),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    text, tokens, finish_reason = await asyncio.to_thread(
+        _generate_blocking, cur, req.prompt, gen_req, False,
+    )
+    cur.generations += 1
+    cur.total_tokens += tokens
+    cur.last_used = time.time()
+    return {
+        "id": completion_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model_id,
+        "system_fingerprint": None,
+        "choices": [{
+            "text": text or "",
+            "index": 0,
+            "logprobs": None,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": tokens,
+            "total_tokens": tokens,
+        },
+    }
+
+
+async def _oai_stream_completions(
+    cur: LoadedModel, prompt: str, req: GenerateRequest, model_id: str,
+    completion_id: str, created: int, include_usage: bool = False,
+) -> AsyncIterator[bytes]:
+    """Stream text.completion.chunk events for /v1/completions."""
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    sentinel = object()
+
+    def cmpl_chunk(text: str, finish_reason: Optional[str] = None) -> bytes:
+        payload = {
+            "id": completion_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_id,
+            "system_fingerprint": None,
+            "choices": [{
+                "text": text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": finish_reason,
+            }],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    def worker():
+        t0 = time.time()
+        with engine.gen_lock:
+            waited = time.time() - t0
+            if waited > 0.1:
+                log.info("MLX (completions stream) queued for %.1fs", waited)
+            t_gen_start = time.time()
+            asyncio.run_coroutine_threadsafe(queue.put({"__gen_start__": t_gen_start}), loop)
+            try:
+                iterator = _make_iterator(cur, prompt, req)
+                gen_finish_reason = "stop"
+                for c in iterator:
+                    piece = getattr(c, "text", c) if not isinstance(c, str) else c
+                    if piece:
+                        asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
+                    fr = getattr(c, "finish_reason", None)
+                    if fr:
+                        gen_finish_reason = fr
+                asyncio.run_coroutine_threadsafe(queue.put({"__finish_reason__": gen_finish_reason}), loop)
+            except Exception as e:
+                asyncio.run_coroutine_threadsafe(queue.put({"__error__": str(e)}), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(sentinel), loop)
+
+    loop.run_in_executor(None, worker)
+
+    finish_reason = "stop"
+    token_count = 0
+    t_gen_start: Optional[float] = None
+    t_first_token: Optional[float] = None
+
+    stripper = ThinkStripper(
+        enabled=_strip_thinking_enabled(cur),
+        starts_in_think=False,
+    )
+
+    while True:
+        item = await queue.get()
+        if item is sentinel:
+            break
+        if isinstance(item, dict) and "__gen_start__" in item:
+            t_gen_start = item["__gen_start__"]
+            continue
+        if isinstance(item, dict) and "__finish_reason__" in item:
+            finish_reason = item["__finish_reason__"]
+            continue
+        if isinstance(item, dict) and "__error__" in item:
+            log.warning("completions: stream error: %s", item["__error__"])
+            yield cmpl_chunk("", finish_reason="stop")
+            finish_reason = "stop"
+            break
+        token_count += 1
+        if t_first_token is None:
+            t_first_token = time.time()
+        visible = stripper.feed(item)
+        if visible:
+            yield cmpl_chunk(visible)
+
+    tail = stripper.flush()
+    if tail:
+        yield cmpl_chunk(tail)
+
+    yield cmpl_chunk("", finish_reason=finish_reason)
+
+    if include_usage:
+        usage_payload = {
+            "id": completion_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_id,
+            "system_fingerprint": None,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": token_count,
+                "total_tokens": token_count,
+            },
+        }
+        yield f"data: {json.dumps(usage_payload)}\n\n".encode()
+
+    yield b"data: [DONE]\n\n"
+
+    cur.generations += 1
+    cur.total_tokens += token_count
+    cur.last_used = time.time()
+    t_end = time.time()
+    if t_first_token and t_gen_start:
+        cur.last_ttft = t_first_token - t_gen_start
+    if t_gen_start:
+        elapsed = t_end - t_gen_start
+        cur.last_tps = token_count / elapsed if elapsed > 0 else None
 
 
 @app.post("/v1/chat/completions")
@@ -1745,6 +2041,8 @@ async def v1_chat_completions(req: OAIChatRequest):
         max_tokens=resolved_max_tokens,
         temperature=req.temperature if req.temperature is not None else saved.get("temperature", DEFAULT_GEN["temperature"]),
         top_p=req.top_p if req.top_p is not None else saved.get("top_p", DEFAULT_GEN["top_p"]),
+        min_p=req.min_p,
+        repetition_penalty=req.repetition_penalty,
         stream=req.stream,
     )
 
@@ -1992,20 +2290,14 @@ async def _oai_stream_chat(
             waited = time.time() - t0
             if waited > 0.1:
                 log.info("MLX (chat stream) queued for %.1fs before starting", waited)
+            # Announce the moment generation actually starts so the consumer
+            # can compute Time To First Token without clock-skew from queuing.
+            t_gen_start = time.time()
+            asyncio.run_coroutine_threadsafe(
+                queue.put({"__gen_start__": t_gen_start}), loop
+            )
             try:
-                try:
-                    from mlx_lm.sample_utils import make_sampler
-
-                    sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
-                    iterator = stream_generate(
-                        cur.model, cur.tokenizer, prompt=prompt,
-                        max_tokens=req.max_tokens, sampler=sampler,
-                    )
-                except Exception:
-                    iterator = stream_generate(
-                        cur.model, cur.tokenizer, prompt=prompt,
-                        max_tokens=req.max_tokens, temp=req.temperature,
-                    )
+                iterator = _make_iterator(cur, prompt, req)
                 gen_finish_reason = "stop"
                 for c in iterator:
                     piece = getattr(c, "text", c) if not isinstance(c, str) else c
@@ -2034,6 +2326,9 @@ async def _oai_stream_chat(
     tool_index = 0
     tools_emitted = 0
     finish_reason = "stop"
+    # TTFT tracking: populated from __gen_start__ worker message + first token.
+    t_gen_start: Optional[float] = None
+    t_first_token: Optional[float] = None
 
     # Raw-JSON tool-call buffer — for models that emit bare JSON with no
     # wrapper tags (Llama 3.x default chat template, Gemma 3 IT).
@@ -2073,6 +2368,9 @@ async def _oai_stream_chat(
         item = await queue.get()
         if item is sentinel:
             break
+        if isinstance(item, dict) and "__gen_start__" in item:
+            t_gen_start = item["__gen_start__"]
+            continue
         if isinstance(item, dict) and "__finish_reason__" in item:
             finish_reason = item["__finish_reason__"]  # "stop" or "length" from mlx-lm
             continue
@@ -2084,6 +2382,8 @@ async def _oai_stream_chat(
             finish_reason = "stop"
             break
         token_count += 1
+        if t_first_token is None:
+            t_first_token = time.time()
         # Capture for diagnostics, up to cap.
         if sum(len(s) for s in raw_output_capture) < raw_output_cap:
             raw_output_capture.append(item)
@@ -2210,16 +2510,27 @@ async def _oai_stream_chat(
     cur.total_tokens += token_count
     cur.last_used = time.time()
 
+    # Compute and store TTFT / throughput on the model so /api/status exposes them.
+    t_stream_end = time.time()
+    if t_first_token is not None and t_gen_start is not None:
+        cur.last_ttft = t_first_token - t_gen_start
+    if t_gen_start is not None:
+        elapsed = t_stream_end - t_gen_start
+        cur.last_tps = token_count / elapsed if elapsed > 0 else None
+
     raw_preview = "".join(raw_output_capture)[:800]
     log.info(
-        "chat: id=%s stream done tokens=%d tool_calls=%d finish=%s raw_preview=%r",
-        completion_id, token_count, tools_emitted, finish_reason, raw_preview,
+        "chat: id=%s stream done tokens=%d tool_calls=%d finish=%s ttft=%.3fs tps=%.1f raw_preview=%r",
+        completion_id, token_count, tools_emitted, finish_reason,
+        cur.last_ttft or 0, cur.last_tps or 0, raw_preview,
     )
     _update_chat(completion_id, {
         "output_preview": raw_preview,
         "tokens": token_count,
         "tool_calls_emitted": tools_emitted,
         "finish_reason": finish_reason,
+        "ttft": cur.last_ttft,
+        "tps": cur.last_tps,
     })
 
 
@@ -2237,6 +2548,8 @@ class ModelSettingsBody(BaseModel):
     # Qwen-family ``enable_thinking`` chat-template flag. ``None`` = auto
     # (False when tools are present, True otherwise).
     enable_thinking: Optional[bool] = None
+    # Auto-unload the model after this many minutes of inactivity. None = never.
+    idle_timeout_minutes: Optional[int] = Field(default=None, ge=1, le=10080)
 
 
 @app.get("/api/settings")

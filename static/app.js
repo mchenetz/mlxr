@@ -76,12 +76,16 @@ function renderStatus(s) {
   }
   renderPythonWarning(versions);
 
+  const ttftStr = m.last_ttft != null ? `${(m.last_ttft * 1000).toFixed(0)} ms` : "—";
+  const tpsStr  = m.last_tps  != null ? `${m.last_tps.toFixed(1)} tok/s` : "—";
   $("modelInfo").textContent = m.loaded
     ? `name:           ${m.name}
 context_length: ${m.context_length != null ? m.context_length.toLocaleString() + " tokens" : "unknown"}
 uptime:         ${fmtSeconds(m.uptime_seconds)}
 generations:    ${m.generations}
-total_tokens:   ${m.total_tokens}`
+total_tokens:   ${m.total_tokens}
+last TTFT:      ${ttftStr}
+last throughput:${tpsStr}`
     : "No model loaded.";
 
   renderEndpoint(m.loaded ? m.name : null, m.context_length);
@@ -411,6 +415,7 @@ async function loadModelSettings(name) {
     $("setMaxTokens").value = s.max_tokens != null ? s.max_tokens : "";
     $("setContextLength").value = s.context_length != null ? s.context_length : "";
     $("setAutoload").checked = !!s.autoload;
+    $("setIdleTimeout").value = s.idle_timeout_minutes != null ? s.idle_timeout_minutes : "";
     // default on if unset
     $("setStripThinking").checked = s.strip_thinking !== false;
     $("setEnableThinking").value =
@@ -431,6 +436,7 @@ $("saveSettingsBtn").addEventListener("click", async () => {
     max_tokens: $("setMaxTokens").value === "" ? null : Number($("setMaxTokens").value),
     context_length: $("setContextLength").value === "" ? null : Number($("setContextLength").value),
     autoload: $("setAutoload").checked,
+    idle_timeout_minutes: $("setIdleTimeout").value === "" ? null : Number($("setIdleTimeout").value),
     strip_thinking: $("setStripThinking").checked,
     enable_thinking:
       $("setEnableThinking").value === "true" ? true :
@@ -833,6 +839,70 @@ async function waitForServer(maxWaitMs = 30000) {
   return false;
 }
 
+// ---- Recent Requests inspector ----------------------------------------
+
+$("refreshRecentBtn").addEventListener("click", refreshRecentRequests);
+
+async function refreshRecentRequests() {
+  const hint = $("recentHint");
+  hint.textContent = "Loading…";
+  try {
+    const r = await api("/api/debug/recent_chats");
+    renderRecentRequests(r.recent || []);
+    hint.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    hint.textContent = `Error: ${e.message}`;
+  }
+}
+
+function renderRecentRequests(items) {
+  const container = $("recentRequestsList");
+  const badge = $("recentRequestsBadge");
+  if (!items.length) {
+    container.innerHTML = `<p class="muted">No requests yet. Make a /v1/chat/completions call to see it here.</p>`;
+    badge.style.display = "none";
+    return;
+  }
+
+  badge.textContent = items.length;
+  badge.className = "badge ok";
+  badge.style.display = "";
+
+  // Show newest first (server already reverses, but guard anyway).
+  const sorted = [...items].reverse();
+  container.innerHTML = "";
+
+  for (const req of sorted) {
+    const el = document.createElement("details");
+    el.className = "example recent-request";
+
+    const ts = req.created ? new Date(req.created * 1000).toLocaleTimeString() : "?";
+    const finishBadge = req.finish_reason === "tool_calls" ? "ok"
+                      : req.finish_reason === "length" ? "err" : "";
+    const ttftStr = req.ttft != null ? `TTFT ${(req.ttft * 1000).toFixed(0)} ms` : "";
+    const tpsStr  = req.tps  != null ? ` · ${req.tps.toFixed(1)} tok/s` : "";
+    const toolStr = req.tools && req.tools.length ? ` · tools: ${req.tools.join(", ")}` : "";
+    const tcStr   = req.tool_calls_emitted ? ` · ${req.tool_calls_emitted} call(s) emitted` : "";
+
+    el.innerHTML = `
+      <summary>
+        <span class="mono" style="font-size:11px;color:var(--muted)">${escapeHtml(ts)}</span>
+        <span style="margin:0 6px">${escapeHtml((req.model || "").split("/").pop() || req.model || "—")}</span>
+        ${req.finish_reason ? `<span class="badge ${finishBadge}" style="font-size:10px">${escapeHtml(req.finish_reason)}</span>` : ""}
+        <span class="muted" style="font-size:11px;margin-left:6px">${escapeHtml(ttftStr + tpsStr + toolStr + tcStr)}</span>
+        <span class="muted" style="font-size:11px;margin-left:auto">${req.tokens != null ? req.tokens + " tok" : ""} · ${req.stream ? "stream" : "blocking"} · ${req.messages || 0} msg</span>
+      </summary>
+      <div style="padding:8px 0 0">
+        ${req.prompt_tail ? `<div class="muted" style="font-size:11px;margin-bottom:4px">Prompt tail (${req.prompt_length || "?"} chars total):</div>
+        <pre class="output mini-output" style="max-height:80px">${escapeHtml(req.prompt_tail)}</pre>` : ""}
+        ${req.output_preview ? `<div class="muted" style="font-size:11px;margin:6px 0 4px">Output preview:</div>
+        <pre class="output mini-output" style="max-height:80px">${escapeHtml(req.output_preview)}</pre>` : ""}
+        <div class="muted" style="font-size:10px;margin-top:4px">id: ${escapeHtml(req.id || "—")}</div>
+      </div>`;
+    container.appendChild(el);
+  }
+}
+
 $("output").classList.add("empty");
 // Populate endpoint info up-front so Base URL / examples are always visible,
 // even if the backend hasn't responded yet (e.g. in a preview panel).
@@ -841,6 +911,8 @@ refreshStatus();
 refreshCache();
 refreshDownloads();
 checkUpdates();
+refreshRecentRequests();
 setInterval(refreshStatus, 2500);
+setInterval(refreshRecentRequests, 10000);
 // Download polling is adaptive: starts automatically when a download begins,
 // stops when all downloads are done. No constant background noise when idle.
