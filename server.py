@@ -161,133 +161,15 @@ def _load_llm(name: str) -> LoadedModel:
     return LoadedModel(name=name, loaded_at=time.time(), model=model, tokenizer=tokenizer, context_length=ctx)
 
 
-def _make_dummy_media_processor_class():
-    """Build a _DummyMediaProcessor that satisfies transformers' isinstance check.
-
-    transformers' ProcessorMixin.check_argument_for_proper_class() verifies
-    that the video_processor argument is an instance of BaseVideoProcessor.
-    When torchvision is absent, transformers exports a dummy BaseVideoProcessor
-    (from dummy_torchvision_objects) that has no torch dependency — we subclass
-    it so our stub passes the isinstance gate without needing torchvision.
-    Falls back to plain object if the import fails.
-    """
-    try:
-        from transformers.utils.dummy_torchvision_objects import (
-            BaseVideoProcessor as _DummyBVP,
-        )
-        _base = _DummyBVP
-    except ImportError:
-        _base = object  # type: ignore[assignment]
-
-    class _DummyMediaProcessor(_base):  # type: ignore[valid-type]
-        """Stand-in for a video or audio processor when torch/torchvision are absent.
-
-        Subclasses transformers' dummy BaseVideoProcessor so that
-        ProcessorMixin.check_argument_for_proper_class() passes the isinstance
-        check.  Raises a helpful RuntimeError if video/audio inference is
-        actually attempted.  Image inference is completely unaffected.
-        """
-        def __init__(self, kind: str = "video") -> None:
-            # deliberately skip super().__init__() — the dummy parent's __init__
-            # calls requires_backends which would raise ImportError.
-            self._kind = kind
-
-        def __repr__(self) -> str:
-            return (
-                f"<Dummy{self._kind.title()}Processor: "
-                f"torch not installed — {self._kind} inference disabled>"
-            )
-
-        def __call__(self, *args, **kwargs):  # type: ignore[override]
-            raise RuntimeError(
-                f"{self._kind.title()} processing requires torch/torchvision "
-                "which are not installed. "
-                "Install with: pip install torch torchvision"
-            )
-
-        def preprocess(self, *args, **kwargs):
-            raise RuntimeError(
-                f"{self._kind.title()} processing requires torch/torchvision "
-                "which are not installed."
-            )
-
-    return _DummyMediaProcessor
-
-
-_DummyMediaProcessor = _make_dummy_media_processor_class()
-
-
-def _make_safe_from_pretrained(orig, kind: str):
-    """Return a classmethod wrapper that substitutes a DummyMediaProcessor on
-    torch-related ImportErrors, leaving all other errors propagating normally."""
-
-    @classmethod  # type: ignore[misc]
-    def _safe(cls, pretrained_model_name_or_path, **kwargs):
-        try:
-            return orig.__func__(cls, pretrained_model_name_or_path, **kwargs)
-        except ImportError as _e:
-            if "torch" in str(_e).lower() or "torchvision" in str(_e).lower():
-                log.info(
-                    "VLM: torch-required %s processor skipped for %s "
-                    "(image inference still works). Reason: %s",
-                    kind, pretrained_model_name_or_path, _e,
-                )
-                return _DummyMediaProcessor(kind)
-            raise
-
-    return _safe
-
-
-def _patch_torch_dependent_processors() -> list:
-    """Patch AutoVideoProcessor and AutoAudioProcessor so they return
-    DummyMediaProcessor stubs instead of raising ImportError when
-    torch/torchvision are not installed.
-
-    Required for transformers ≥5.x where models like Qwen3-VL register a
-    Qwen3VLVideoProcessor that hard-requires torch even in image-only mode.
-
-    Returns a list of (cls, orig_method) so the caller can restore the originals.
-    """
-    patches: list = []
-
-    _TARGETS = [
-        ("transformers.models.auto.video_processing_auto", "AutoVideoProcessor", "video"),
-        ("transformers.models.auto.audio_processing_auto", "AutoAudioProcessor", "audio"),
-    ]
-    for module_path, cls_name, kind in _TARGETS:
-        try:
-            mod = __import__(module_path, fromlist=[cls_name])
-            cls = getattr(mod, cls_name)
-            orig = cls.from_pretrained
-            cls.from_pretrained = _make_safe_from_pretrained(orig, kind)
-            patches.append((cls, orig))
-        except Exception as _e:
-            log.debug("VLM: could not patch %s (%s)", cls_name, _e)
-
-    return patches
-
-
 def _load_vlm(name: str) -> LoadedModel:
     try:
         from mlx_vlm import load as vlm_load
     except ImportError:
         raise RuntimeError(
             f"{name} appears to be a VLM but mlx-vlm is not installed. "
-            "Run: pip install mlx-vlm"
+            "Run: pip install mlx-vlm torch torchvision"
         )
-
-    # transformers ≥5.x registers video/audio processor classes (e.g.
-    # Qwen3VLVideoProcessor) that hard-require torch/torchvision even when
-    # only image inference is needed.  Patch those auto-classes to return
-    # harmless stubs so the image processor loads cleanly with MLX.
-    _media_patches = _patch_torch_dependent_processors()
-    try:
-        model, processor = vlm_load(name)
-    finally:
-        # Restore originals so the patches don't leak to other calls.
-        for _cls, _orig in _media_patches:
-            _cls.from_pretrained = _orig
-
+    model, processor = vlm_load(name)
     tokenizer = getattr(processor, "tokenizer", processor)
     auto_ctx = _detect_context_length(tokenizer, name)
     saved_ctx = settings.get_model(name).get("context_length")

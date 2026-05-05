@@ -6,9 +6,12 @@ mlx-lm>=0.21
 psutil>=5.9
 huggingface_hub>=0.23
 
-# Optional: VLM support (Qwen3.5-VL, GLM-4V, Pixtral, LLaVA, etc.)
-# Uncomment to install:
+# Optional: VLM support (Qwen3-VL, GLM-4V, Pixtral, LLaVA, etc.)
+# torch and torchvision are required by transformers' processor classes
+# even though MLX handles all actual inference.  Uncomment all three:
 # mlx-vlm>=0.4.4
+# torch>=2.4
+# torchvision
 
 # Optional: macOS menu bar app (python menubar.py)
 # pip install rumps
