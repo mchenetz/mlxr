@@ -161,28 +161,60 @@ def _load_llm(name: str) -> LoadedModel:
     return LoadedModel(name=name, loaded_at=time.time(), model=model, tokenizer=tokenizer, context_length=ctx)
 
 
-class _DummyMediaProcessor:
-    """Stand-in for a video or audio processor when torch/torchvision are absent.
+def _make_dummy_media_processor_class():
+    """Build a _DummyMediaProcessor that satisfies transformers' isinstance check.
 
-    Stores nothing; raises a helpful error if someone actually tries to call it.
-    Image inference via the image_processor is completely unaffected.
+    transformers' ProcessorMixin.check_argument_for_proper_class() verifies
+    that the video_processor argument is an instance of BaseVideoProcessor.
+    When torchvision is absent, transformers exports a dummy BaseVideoProcessor
+    (from dummy_torchvision_objects) that has no torch dependency — we subclass
+    it so our stub passes the isinstance gate without needing torchvision.
+    Falls back to plain object if the import fails.
     """
-    def __init__(self, kind: str = "video") -> None:
-        self._kind = kind
-
-    def __repr__(self) -> str:
-        return f"<Dummy{self._kind.title()}Processor: torch not installed — {self._kind} inference disabled>"
-
-    def __call__(self, *args, **kwargs):  # type: ignore[override]
-        raise RuntimeError(
-            f"{self._kind.title()} processing requires torch/torchvision which are not installed. "
-            "Install with: pip install torch torchvision"
+    try:
+        from transformers.utils.dummy_torchvision_objects import (
+            BaseVideoProcessor as _DummyBVP,
         )
+        _base = _DummyBVP
+    except ImportError:
+        _base = object  # type: ignore[assignment]
 
-    def preprocess(self, *args, **kwargs):
-        raise RuntimeError(
-            f"{self._kind.title()} processing requires torch/torchvision which are not installed."
-        )
+    class _DummyMediaProcessor(_base):  # type: ignore[valid-type]
+        """Stand-in for a video or audio processor when torch/torchvision are absent.
+
+        Subclasses transformers' dummy BaseVideoProcessor so that
+        ProcessorMixin.check_argument_for_proper_class() passes the isinstance
+        check.  Raises a helpful RuntimeError if video/audio inference is
+        actually attempted.  Image inference is completely unaffected.
+        """
+        def __init__(self, kind: str = "video") -> None:
+            # deliberately skip super().__init__() — the dummy parent's __init__
+            # calls requires_backends which would raise ImportError.
+            self._kind = kind
+
+        def __repr__(self) -> str:
+            return (
+                f"<Dummy{self._kind.title()}Processor: "
+                f"torch not installed — {self._kind} inference disabled>"
+            )
+
+        def __call__(self, *args, **kwargs):  # type: ignore[override]
+            raise RuntimeError(
+                f"{self._kind.title()} processing requires torch/torchvision "
+                "which are not installed. "
+                "Install with: pip install torch torchvision"
+            )
+
+        def preprocess(self, *args, **kwargs):
+            raise RuntimeError(
+                f"{self._kind.title()} processing requires torch/torchvision "
+                "which are not installed."
+            )
+
+    return _DummyMediaProcessor
+
+
+_DummyMediaProcessor = _make_dummy_media_processor_class()
 
 
 def _make_safe_from_pretrained(orig, kind: str):
