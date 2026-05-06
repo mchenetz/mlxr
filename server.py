@@ -191,21 +191,35 @@ def _is_model_cached(name: str) -> bool:
 
 # ---- VLM helpers ---------------------------------------------------------
 
-_VLM_CONFIG_KEYS = frozenset([
-    "vision_config", "visual_config", "image_token_id",
-    "num_image_tokens", "pixel_values_videos", "visual_token_id",
-    "image_seq_length", "vision_tower",
-])
+# Structural keys: presence of a non-empty vision tower config block is the
+# only reliable VLM signal.  Token-id-only signals (image_token_id, etc.) leak
+# into text-only Qwen3 quantizations whose configs were copied from a
+# multimodal sibling — those models will FAIL to load through mlx_vlm because
+# their weight files don't contain the vision-tower parameters.
+_VLM_VISION_CONFIG_KEYS = ("vision_config", "visual_config", "vision_tower")
 
 
 def _is_vlm_model(name: str) -> bool:
-    """Check model config.json for VLM indicators. Returns False on any error."""
+    """Check model config.json for VLM indicators. Returns False on any error.
+
+    Requires a non-empty vision_config/visual_config/vision_tower block.
+    Models that only carry image_token_id without an actual vision tower are
+    treated as text-only LLMs (their weights wouldn't satisfy mlx_vlm anyway).
+    """
     try:
         from huggingface_hub import try_to_load_from_cache
         cfg_path = try_to_load_from_cache(name, "config.json")
-        if cfg_path:
-            cfg = json.loads(open(cfg_path).read())
-            return bool(_VLM_CONFIG_KEYS & set(cfg.keys()))
+        if not cfg_path:
+            return False
+        cfg = json.loads(open(cfg_path).read())
+        for key in _VLM_VISION_CONFIG_KEYS:
+            val = cfg.get(key)
+            # Must be a non-empty dict/object — empty {} or absent → not VLM
+            if isinstance(val, dict) and val:
+                return True
+            if val and not isinstance(val, (dict, list)):
+                # E.g. vision_tower as a string class name
+                return True
     except Exception:
         pass
     return False
