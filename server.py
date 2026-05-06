@@ -198,6 +198,47 @@ def _is_model_cached(name: str) -> bool:
 # their weight files don't contain the vision-tower parameters.
 _VLM_VISION_CONFIG_KEYS = ("vision_config", "visual_config", "vision_tower")
 
+# quant_method values that MLX's loaders can read.  Anything else (paroquant,
+# awq, gptq, bitsandbytes, …) requires its own runtime — mlx_lm / mlx_vlm
+# will produce a confusing weight-shape error mid-load otherwise.
+_MLX_KNOWN_QUANT_METHODS = frozenset({"mlx", ""})
+
+# Hints for the user when we encounter a non-MLX quant method.
+_QUANT_METHOD_HINTS = {
+    "paroquant": (
+        "ParoQuant has its own runtime — install with "
+        "'pip install \"paroquant[mlx]\"' and run "
+        "'python -m paroquant.cli.serve --model {name} --port 8001'."
+    ),
+    "awq":  "AWQ models need vLLM or AutoAWQ; MLX cannot load them directly.",
+    "gptq": "GPTQ models need AutoGPTQ or vLLM; MLX cannot load them directly.",
+    "bitsandbytes": "bitsandbytes-quantized weights require CUDA; MLX cannot load them.",
+}
+
+
+def _check_supported_quant_method(name: str) -> None:
+    """Raise a friendly error if the model uses a quant method MLX can't read."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        cfg_path = try_to_load_from_cache(name, "config.json")
+        if not cfg_path:
+            return
+        cfg = json.loads(open(cfg_path).read())
+        qcfg = cfg.get("quantization_config") or {}
+        method = (qcfg.get("quant_method") or "").lower()
+    except Exception:
+        return
+    if not method or method in _MLX_KNOWN_QUANT_METHODS:
+        return
+    hint = _QUANT_METHOD_HINTS.get(method, "")
+    msg = (
+        f"{name} is quantized with '{method}', which MLX cannot load. "
+        "Use a model quantized with MLX (mlx-community / unsloth MLX builds) instead."
+    )
+    if hint:
+        msg += " " + hint.format(name=name)
+    raise RuntimeError(msg)
+
 
 def _is_vlm_model(name: str) -> bool:
     """Check model config.json for VLM indicators. Returns False on any error.
@@ -343,6 +384,7 @@ class EnginePool:
                 )
 
             log.info("Loading model %s", name)
+            _check_supported_quant_method(name)
             t0 = time.time()
             is_vlm = _is_vlm_model(name)
             if is_vlm:
