@@ -1759,9 +1759,13 @@ def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, imag
             return _orig_async_eval(*args, **kwargs)
         except RuntimeError as exc:
             msg = str(exc)
+            log.warning("vlm: async_eval failed: %s — falling back to sync eval", msg)
             if "Stream" in msg and "current thread" in msg:
-                log.debug("vlm: async_eval cross-thread error → sync eval fallback: %s", msg)
-                return _mx.eval(*args, **kwargs)
+                try:
+                    return _mx.eval(*args, **kwargs)
+                except Exception as exc2:
+                    log.error("vlm: sync eval fallback ALSO failed: %s", exc2)
+                    raise
             raise
 
     _mx.async_eval = _safe_async_eval
@@ -1771,6 +1775,11 @@ def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, imag
             image=image_arg,
             **gen_kwargs,
         )
+    except Exception as _e:
+        import traceback as _tb
+        log.error("vlm: vlm_stream raised — generation_stream=%s\n%s",
+                  _gen_globals.get("generation_stream"), _tb.format_exc())
+        raise
     finally:
         _mx.async_eval = _orig_async_eval
 
