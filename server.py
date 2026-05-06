@@ -4338,7 +4338,7 @@ async def api_tool_mappings_probe() -> dict:
     from tool_mappings import get_registry
     from tool_mappings.ai_creator import run_probe, derive_mapping
 
-    cur = engine.current()
+    cur = engine.current
     if cur is None:
         raise HTTPException(status_code=503, detail="No model is loaded. Load a model first.")
 
@@ -4349,8 +4349,6 @@ async def api_tool_mappings_probe() -> dict:
         tool_choice: str | None,
         max_tokens: int,
     ) -> str:
-        from server import GenerateRequest, _generate_blocking, _render_chat  # type: ignore
-        # Build prompt
         prompt = _render_chat(
             cur.tokenizer,
             messages,
