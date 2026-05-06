@@ -1686,19 +1686,19 @@ def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, imag
 
     This is a **generator function** (uses ``yield from``) so that the body
     executes lazily inside the worker thread spawned by ``run_in_executor``.
-    That matters because mlx_vlm creates a module-level Metal stream at import
-    time on the main thread:
 
-        generation_stream = mx.new_stream(mx.default_device())   # line ~239
+    mlx_vlm creates ``generation_stream`` with ``mx.new_stream()`` at import
+    time on the main thread.  ``mx.new_stream()`` returns a thread-local Metal
+    stream — using it (or synchronizing it) from a different worker thread
+    raises "There is no Stream(gpu, N) in current thread".
 
-    Worker threads from the default thread-pool executor have no Metal context
-    and cannot use that stream, producing:
+    ``mlx_lm`` avoids this with ``mx.new_thread_local_stream()``, which has a
+    separate Metal stream slot per thread and is safe from any thread.
 
-        "There is no Stream(gpu, 0) in current thread"
-
-    Fix: create a fresh Metal stream *in this thread*, temporarily replace the
-    module-level ``generation_stream``, then restore it in ``finally``.
-    ``gen_lock`` serialises all VLM generations so the swap is race-free.
+    We apply the same fix to mlx_vlm *once* on the first call: if
+    ``generation_stream`` is still a plain ``Stream``, we replace it with a
+    ``ThreadLocalStream``.  All subsequent calls on any thread just use the
+    upgraded global — no per-call swap or restore needed.
 
     Passes image URLs/paths directly as strings — mlx_vlm ≥0.4 handles
     loading and resizing internally.  Falls back to text-only generation if
@@ -1728,32 +1728,30 @@ def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, imag
         image_arg = valid_images[0] if len(valid_images) == 1 else valid_images
         log.info("vlm: generating with %d image(s)", len(valid_images))
 
-    # mlx_vlm's generation_stream is a module-level global Stream created on the
-    # main thread at import time.  Worker threads from run_in_executor cannot
-    # synchronize that stream (mx.synchronize raises "There is no Stream(gpu, 0)
-    # in current thread").
+    # mlx_vlm creates a module-level generation_stream with mx.new_stream() at
+    # import time on the main thread.  mx.new_stream() produces a *thread-local*
+    # Metal stream — any attempt to synchronize it from a *different* worker
+    # thread raises "There is no Stream(gpu, N) in current thread".
     #
-    # The stream lives in stream_generate's __globals__ dict (NOT as a plain
-    # attribute on the module object — getattr(mlx_vlm.generate) misses it).
-    # We patch the globals dict directly and restore in finally.
-    # gen_lock serialises all VLM calls so the patch is race-free.
+    # mlx_lm solves this correctly by using mx.new_thread_local_stream() which
+    # has a separate slot per thread and is therefore safe from any thread.
+    #
+    # We do a ONE-TIME upgrade: replace mlx_vlm's stream with a ThreadLocalStream
+    # the first time this function runs.  Subsequent calls (on any thread) just
+    # use the already-upgraded global — no swap/restore needed.
     _gen_globals: dict = vlm_stream.__globals__
-    _prev_stream = _gen_globals.get("generation_stream")
-    _new_stream = _mx.new_stream(_mx.gpu)
-    log.info("vlm: stream swap — old=%s  new=%s  thread=%s",
-             _prev_stream, _new_stream, __import__("threading").current_thread().name)
-    _gen_globals["generation_stream"] = _new_stream
-    try:
-        yield from vlm_stream(
-            cur.model, cur.tokenizer, prompt,
-            image=image_arg,
-            **gen_kwargs,
-        )
-    finally:
-        if _prev_stream is not None:
-            _gen_globals["generation_stream"] = _prev_stream
-        else:
-            _gen_globals.pop("generation_stream", None)
+    _existing = _gen_globals.get("generation_stream")
+    if _existing is not None and type(_existing).__name__ == "Stream":
+        _tls = _mx.new_thread_local_stream(_mx.gpu)
+        _gen_globals["generation_stream"] = _tls
+        log.info("vlm: upgraded generation_stream to ThreadLocalStream (%s → %s)",
+                 _existing, _tls)
+
+    yield from vlm_stream(
+        cur.model, cur.tokenizer, prompt,
+        image=image_arg,
+        **gen_kwargs,
+    )
 
 
 def _render_vlm_prompt(cur: LoadedModel, messages: list[dict], images: list) -> str:
