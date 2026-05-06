@@ -144,6 +144,8 @@ def run_probe(model_name: str, generate_fn: GenerateFn) -> str:
             512,
         )
     except Exception as exc:
+        import traceback
+        log.error("tool_mappings: probe generate_fn traceback:\n%s", traceback.format_exc())
         raise RuntimeError(f"Probe generation failed: {exc}") from exc
 
     log.info("tool_mappings: probe raw output (%d chars): %r", len(raw), raw[:200])

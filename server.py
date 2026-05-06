@@ -1741,17 +1741,28 @@ def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, imag
     # use the already-upgraded global — no swap/restore needed.
     _gen_globals: dict = vlm_stream.__globals__
     _existing = _gen_globals.get("generation_stream")
+    log.info("vlm: generation_stream before upgrade check: %s (type=%s) thread=%s",
+             _existing, type(_existing).__name__,
+             __import__("threading").current_thread().name)
     if _existing is not None and type(_existing).__name__ == "Stream":
         _tls = _mx.new_thread_local_stream(_mx.gpu)
         _gen_globals["generation_stream"] = _tls
         log.info("vlm: upgraded generation_stream to ThreadLocalStream (%s → %s)",
                  _existing, _tls)
 
-    yield from vlm_stream(
-        cur.model, cur.tokenizer, prompt,
-        image=image_arg,
-        **gen_kwargs,
-    )
+    log.info("vlm: calling vlm_stream, generation_stream now = %s",
+             _gen_globals.get("generation_stream"))
+    try:
+        yield from vlm_stream(
+            cur.model, cur.tokenizer, prompt,
+            image=image_arg,
+            **gen_kwargs,
+        )
+    except Exception as _e:
+        import traceback as _tb
+        log.error("vlm: vlm_stream raised exception — generation_stream=%s\n%s",
+                  _gen_globals.get("generation_stream"), _tb.format_exc())
+        raise
 
 
 def _render_vlm_prompt(cur: LoadedModel, messages: list[dict], images: list) -> str:
