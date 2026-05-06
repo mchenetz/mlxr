@@ -1728,41 +1728,51 @@ def _make_vlm_iterator(cur: LoadedModel, prompt: str, req: GenerateRequest, imag
         image_arg = valid_images[0] if len(valid_images) == 1 else valid_images
         log.info("vlm: generating with %d image(s)", len(valid_images))
 
-    # mlx_vlm creates a module-level generation_stream with mx.new_stream() at
-    # import time on the main thread.  mx.new_stream() produces a *thread-local*
-    # Metal stream — any attempt to synchronize it from a *different* worker
-    # thread raises "There is no Stream(gpu, N) in current thread".
+    # Two MLX/thread issues we must work around:
     #
-    # mlx_lm solves this correctly by using mx.new_thread_local_stream() which
-    # has a separate slot per thread and is therefore safe from any thread.
+    # 1. mlx_vlm creates ``generation_stream`` with ``mx.new_stream()`` at import
+    #    time on the main thread.  That stream is thread-local — any attempt to
+    #    synchronize it from a *different* worker thread raises
+    #    "There is no Stream(gpu, N) in current thread".  Fix: upgrade once to
+    #    ``mx.new_thread_local_stream()``, which has a separate Metal slot per
+    #    thread and is safe from any thread.
     #
-    # We do a ONE-TIME upgrade: replace mlx_vlm's stream with a ThreadLocalStream
-    # the first time this function runs.  Subsequent calls (on any thread) just
-    # use the already-upgraded global — no swap/restore needed.
+    # 2. ``mx.async_eval(y)`` (mlx_vlm/generate.py:553) keeps a per-thread cached
+    #    stream for async evaluation.  When the async-eval bookkeeping references
+    #    a stream id that does not belong to the current worker thread, the same
+    #    "There is no Stream(gpu, N) in current thread" error is raised.  Fix:
+    #    monkey-patch ``mx.async_eval`` for the duration of this call so that
+    #    cross-thread failures fall back to ``mx.eval`` (sync).  We lose the
+    #    overlap-compute optimization but still produce correct output.
     _gen_globals: dict = vlm_stream.__globals__
     _existing = _gen_globals.get("generation_stream")
-    log.info("vlm: generation_stream before upgrade check: %s (type=%s) thread=%s",
-             _existing, type(_existing).__name__,
-             __import__("threading").current_thread().name)
     if _existing is not None and type(_existing).__name__ == "Stream":
         _tls = _mx.new_thread_local_stream(_mx.gpu)
         _gen_globals["generation_stream"] = _tls
         log.info("vlm: upgraded generation_stream to ThreadLocalStream (%s → %s)",
                  _existing, _tls)
 
-    log.info("vlm: calling vlm_stream, generation_stream now = %s",
-             _gen_globals.get("generation_stream"))
+    _orig_async_eval = _mx.async_eval
+
+    def _safe_async_eval(*args, **kwargs):
+        try:
+            return _orig_async_eval(*args, **kwargs)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Stream" in msg and "current thread" in msg:
+                log.debug("vlm: async_eval cross-thread error → sync eval fallback: %s", msg)
+                return _mx.eval(*args, **kwargs)
+            raise
+
+    _mx.async_eval = _safe_async_eval
     try:
         yield from vlm_stream(
             cur.model, cur.tokenizer, prompt,
             image=image_arg,
             **gen_kwargs,
         )
-    except Exception as _e:
-        import traceback as _tb
-        log.error("vlm: vlm_stream raised exception — generation_stream=%s\n%s",
-                  _gen_globals.get("generation_stream"), _tb.format_exc())
-        raise
+    finally:
+        _mx.async_eval = _orig_async_eval
 
 
 def _render_vlm_prompt(cur: LoadedModel, messages: list[dict], images: list) -> str:
