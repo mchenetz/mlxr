@@ -216,16 +216,49 @@ def _heuristic_detect(
 ) -> Optional[MappingDefinition]:
     """Check raw_output against known tag-pairs and bare-JSON signals.
 
+    When multiple builtins use the same wrapper tag (e.g. qwen3-hermes-json
+    and qwen3-xml both wrap with <tool_call>…</tool_call>), inspect the body
+    between the tags to pick the one whose body_format actually matches.
+
     Returns a cloned definition with model-specific match_globs, or None.
     """
-    # 1. Scan for tag pairs
+    # 1. Scan for tag pairs — collect *all* matching builtins, then pick best
+    matches: list[tuple[MappingDefinition, str, str]] = []  # (defn, open, body)
     for defn in builtins:
         for tp in defn.detection.tag_pairs:
-            if tp.open in raw_output:
-                log.info(
-                    "tool_mappings: heuristic found tag %r (builtin=%s)", tp.open, defn.id
-                )
-                return _clone_for_model(defn, model_name)
+            i = raw_output.find(tp.open)
+            if i < 0:
+                continue
+            body_start = i + len(tp.open)
+            j = raw_output.find(tp.close, body_start)
+            body = raw_output[body_start:j].strip() if j >= 0 else raw_output[body_start:].strip()
+            matches.append((defn, tp.open, body))
+            break  # one tag-pair per builtin is enough
+
+    if matches:
+        body = matches[0][2]
+        body_is_xml = "<function" in body and "<parameter" in body
+        body_is_json = body.startswith("{") or body.startswith("[")
+
+        # Prefer a builtin whose body_format matches what we actually see
+        if body_is_xml:
+            for defn, tag, _ in matches:
+                if defn.body_format.type == "xml_function_tag":
+                    log.info("tool_mappings: heuristic found tag %r with XML body (builtin=%s)",
+                             tag, defn.id)
+                    return _clone_for_model(defn, model_name)
+        if body_is_json:
+            for defn, tag, _ in matches:
+                if defn.body_format.type in ("json_object", "fenced_json"):
+                    log.info("tool_mappings: heuristic found tag %r with JSON body (builtin=%s)",
+                             tag, defn.id)
+                    return _clone_for_model(defn, model_name)
+
+        # Fall back to the first match (legacy behaviour)
+        defn, tag, _ = matches[0]
+        log.info("tool_mappings: heuristic found tag %r (builtin=%s, body type unclear)",
+                 tag, defn.id)
+        return _clone_for_model(defn, model_name)
 
     # 2. Bare-JSON signal
     stripped = raw_output.strip()
